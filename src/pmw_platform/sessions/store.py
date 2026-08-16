@@ -79,7 +79,7 @@ def _validate_briefing_identity(plan: CohortPlan, raw: bytes) -> None:
     if canonical != raw:
         raise PlanStoreError("briefing JSON is not canonical")
     expected = {
-        "schema": "PMW_MATHEMATICAL_SITUATION_1",
+        "schema": "PMW_MATHEMATICAL_SITUATION_2",
         "world_id": plan.world_id,
         "world_ref": plan.world_ref,
         "snapshot_ref": plan.base_snapshot_ref,

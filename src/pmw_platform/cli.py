@@ -14,6 +14,13 @@ import signal
 import sys
 from typing import Awaitable, Sequence, TypeVar
 
+from .apparatus import (
+    AmfApparatusPreflightChecker,
+    ReadinessScopeChecker,
+    audit_amf_apparatus,
+    persist_verification_receipt,
+    target_bindings_from_briefing,
+)
 from .artifacts import ArtifactStore, ArtifactStoreError
 from .config import (
     ConfigError,
@@ -28,14 +35,22 @@ from .runtime.orchestrator import (
     RuntimeOrchestrationError,
     run_prepared_cohort,
 )
+from .runtime.context import (
+    MAXIMUM_CONTEXT_WINDOW_TOKENS,
+    ContextWindowPolicy,
+)
 from .runtime.publish import PmwContributionPublisher
+from .runtime.preflight import preflight_prepared_cohort
 from .runtime.safety import SafetyProfileError, load_named_profile
 from .runtime.store import RuntimeStore, RuntimeStoreError
 from .sessions import CohortPlan, PlanStoreError, plan_sha256, save_plan
 from .source_lock import SourceLockError, load_core_lock
+from .source_materializer import MaterializedSource, SourceMaterializer
+from .verifier import AmfVerifierService, VerifierStatus
 from .world import (
     ResearchWorld,
     ResearchWorldError,
+    activate_pmw_core,
     build_legacy_frontier_view,
     build_mathematical_situation,
     load_writer_authority,
@@ -113,6 +128,25 @@ def _positive_number(value: str) -> float:
     return selected
 
 
+def _session_context_window(value: str) -> tuple[str, int]:
+    session_id, separator, raw_tokens = value.partition("=")
+    if (
+        not separator
+        or _COHORT_ID.fullmatch(session_id) is None
+        or not raw_tokens
+    ):
+        raise argparse.ArgumentTypeError("must be SESSION_ID=TOKENS")
+    try:
+        tokens = int(raw_tokens)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("TOKENS must be an integer") from error
+    if not 1 <= tokens <= MAXIMUM_CONTEXT_WINDOW_TOKENS:
+        raise argparse.ArgumentTypeError(
+            f"TOKENS must be between 1 and {MAXIMUM_CONTEXT_WINDOW_TOKENS}"
+        )
+    return session_id, tokens
+
+
 _COHORT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
@@ -137,6 +171,7 @@ def _registry(args: argparse.Namespace) -> WorldRegistry:
 def _open_registered(
     args: argparse.Namespace,
 ) -> tuple[WorldRegistration, ResearchWorld]:
+    _activate_managed_pmw_core(args)
     registration = _registry(args).get(args.name)
     world = ResearchWorld.open(
         registration.repo,
@@ -164,6 +199,7 @@ def _world_list(args: argparse.Namespace) -> None:
 
 
 def _world_add(args: argparse.Namespace) -> None:
+    _activate_managed_pmw_core(args)
     world = ResearchWorld.open(
         args.repo,
         world_id=args.name,
@@ -344,10 +380,100 @@ def _runtime_data_root(args: argparse.Namespace) -> Path:
     return expanded
 
 
+def _activate_managed_pmw_core(args: argparse.Namespace) -> None:
+    """Load the PMW Python core from its audited managed source tree."""
+
+    data_root = _runtime_data_root(args)
+    core_lock = load_core_lock()
+    materialized = SourceMaterializer(
+        data_root, core_lock=core_lock
+    ).audit("persistent-mathematical-worlds")
+    activate_pmw_core(
+        materialized.tree_path,
+        tree_sha256=materialized.tree_sha256,
+    )
+
+
 def _runtime_cohort_id(value: object) -> str:
     if type(value) is not str or _COHORT_ID.fullmatch(value) is None:
         raise CommandLineError("cohort must be a canonical cohort ID")
     return value
+
+
+def _runtime_backend(args: argparse.Namespace):
+    if args.backend == "command":
+        return load_command_backend(args.backend_config)
+    if args.backend == "pi":
+        # Lazy import keeps read-only/status operations independent of a Pi
+        # installation and cannot accidentally start a provider request.
+        from .runtime.pi import load_pi_backend
+
+        return load_pi_backend(args.backend_config)
+    raise CommandLineError("unsupported runtime backend")
+
+
+def _runtime_publisher(args: argparse.Namespace, prepared: object):
+    publisher = None
+    if args.writer_authority is not None:
+        publisher = PmwContributionPublisher.create(
+            prepared,
+            load_writer_authority(args.writer_authority),
+        )
+    return publisher
+
+
+def _runtime_limits(args: argparse.Namespace) -> RuntimeLimits:
+    return RuntimeLimits(
+        startup_seconds=args.startup_seconds,
+        session_wall_seconds=(
+            None if args.no_wall_limit else args.wall_seconds
+        ),
+        stop_grace_seconds=args.stop_grace_seconds,
+    )
+
+
+def _runtime_context_policy(args: argparse.Namespace) -> ContextWindowPolicy:
+    overrides: dict[str, int] = {}
+    for session_id, tokens in args.session_context_window:
+        if session_id in overrides:
+            raise CommandLineError(
+                f"duplicate context-window override for {session_id}"
+            )
+        overrides[session_id] = tokens
+    return ContextWindowPolicy(
+        default_tokens=args.context_window_tokens,
+        session_overrides=overrides,
+    )
+
+
+def _runtime_preflight_checkers(args: argparse.Namespace) -> tuple[object, ...]:
+    checkers: list[object] = [ReadinessScopeChecker(args.readiness_scope)]
+    if args.readiness_scope == "amf-production":
+        checkers.append(
+            AmfApparatusPreflightChecker(
+                SourceMaterializer(_runtime_data_root(args))
+            )
+        )
+    return tuple(checkers)
+
+
+def _runtime_preflight_report(
+    args: argparse.Namespace,
+    prepared: object,
+    backend: object,
+    publisher: object,
+    checkers: tuple[object, ...] | None = None,
+):
+    return preflight_prepared_cohort(
+        prepared,
+        backend,
+        limits=_runtime_limits(args),
+        context_policy=_runtime_context_policy(args),
+        publisher=publisher,
+        checkers=(
+            _runtime_preflight_checkers(args) if checkers is None else checkers
+        ),
+    )
 
 
 def _session_start(args: argparse.Namespace) -> int:
@@ -355,30 +481,17 @@ def _session_start(args: argparse.Namespace) -> int:
 
     cohort_id = _runtime_cohort_id(args.cohort)
     prepared = authenticate_plan_bundle(_runtime_data_root(args), cohort_id)
-    if args.backend == "command":
-        backend = load_command_backend(args.backend_config)
-    elif args.backend == "pi":
-        # Lazy import keeps read-only/status operations independent of a Pi
-        # installation and cannot accidentally start a provider request.
-        from .runtime.pi import load_pi_backend
-
-        backend = load_pi_backend(args.backend_config)
-    else:  # argparse choices make this unreachable.
-        raise CommandLineError("unsupported runtime backend")
-
-    publisher = None
-    if args.writer_authority is not None:
-        publisher = PmwContributionPublisher.create(
-            prepared,
-            load_writer_authority(args.writer_authority),
-        )
-    limits = RuntimeLimits(
-        startup_seconds=args.startup_seconds,
-        session_wall_seconds=(
-            None if args.no_wall_limit else args.wall_seconds
-        ),
-        stop_grace_seconds=args.stop_grace_seconds,
+    backend = _runtime_backend(args)
+    publisher = _runtime_publisher(args, prepared)
+    limits = _runtime_limits(args)
+    context_policy = _runtime_context_policy(args)
+    checkers = _runtime_preflight_checkers(args)
+    report = _runtime_preflight_report(
+        args, prepared, backend, publisher, checkers
     )
+    if not report.ready:
+        _emit(report.to_value(), stream=sys.stderr)
+        return 1
     try:
         result = asyncio.run(
             _with_latched_sigint(
@@ -386,7 +499,9 @@ def _session_start(args: argparse.Namespace) -> int:
                     prepared,
                     backend,
                     limits=limits,
+                    context_policy=context_policy,
                     publisher=publisher,
+                    required_checkers=checkers,
                 )
             )
         )
@@ -411,6 +526,18 @@ def _session_start(args: argparse.Namespace) -> int:
         "runtime_root": str(prepared.cohort_root / "runtime"),
     })
     return 0 if result.outcome == "SUCCEEDED" else 1
+
+
+def _session_preflight(args: argparse.Namespace) -> int:
+    """Inspect one launch configuration without creating or starting it."""
+
+    cohort_id = _runtime_cohort_id(args.cohort)
+    prepared = authenticate_plan_bundle(_runtime_data_root(args), cohort_id)
+    backend = _runtime_backend(args)
+    publisher = _runtime_publisher(args, prepared)
+    report = _runtime_preflight_report(args, prepared, backend, publisher)
+    _emit(report.to_value())
+    return 0 if report.ready else 1
 
 
 def _session_status(args: argparse.Namespace) -> None:
@@ -464,6 +591,86 @@ def _artifact_audit(args: argparse.Namespace) -> None:
         "missing_refs": list(missing),
         "valid": not missing,
     })
+
+
+def _source_result(
+    result: MaterializedSource,
+    *,
+    operation: str,
+) -> dict[str, object]:
+    return {
+        "schema": "PMW_LOCKED_SOURCE_READY_1",
+        "operation": operation,
+        "name": result.name,
+        "repository": result.repository,
+        "commit": result.commit,
+        "git_tree": result.git_tree,
+        "tree_sha256": result.tree_sha256,
+        "manifest_sha256": result.manifest_sha256,
+        "file_count": result.file_count,
+        "total_bytes": result.total_bytes,
+        "tree_path": str(result.tree_path),
+        "manifest_path": str(result.manifest_path),
+        "network_calls": 0,
+    }
+
+
+def _source_materialize(args: argparse.Namespace) -> None:
+    result = SourceMaterializer(_runtime_data_root(args)).ensure(
+        args.name,
+        local_repository=args.local_repo,
+    )
+    _emit(_source_result(result, operation="MATERIALIZE_OR_AUDIT"))
+
+
+def _source_audit(args: argparse.Namespace) -> None:
+    result = SourceMaterializer(_runtime_data_root(args)).audit(args.name)
+    _emit(_source_result(result, operation="READ_ONLY_AUDIT"))
+
+
+def _verifier_run(args: argparse.Namespace) -> int:
+    """Host-reexecute one final candidate from a settled session workspace."""
+
+    cohort_id = _runtime_cohort_id(args.cohort)
+    data_root = _runtime_data_root(args)
+    prepared = authenticate_plan_bundle(data_root, cohort_id)
+    session_ids = {item.session_id for item in prepared.plan.sessions}
+    if args.session_id not in session_ids:
+        raise CommandLineError("session-id is not part of the authenticated cohort")
+    store = RuntimeStore(prepared.cohort_root)
+    if store.read_settlement() is None or store.read_receipt(args.session_id) is None:
+        raise CommandLineError("host verification requires a settled session")
+    paths = store.session_paths(args.session_id)
+    source_materializer = SourceMaterializer(data_root)
+    audit_amf_apparatus(prepared, source_materializer)
+    service = AmfVerifierService(
+        source_materializer=source_materializer,
+        artifact_store=ArtifactStore(data_root),
+        target_bindings=target_bindings_from_briefing(prepared.briefing_bytes),
+        python_executable=Path(sys.executable).resolve(strict=True),
+    )
+    receipt = service.verify(
+        session_id=args.session_id,
+        session_workspace=paths.workspace,
+        target_id=args.target_id,
+        candidate_relative_path=args.candidate,
+    )
+    receipt_path = persist_verification_receipt(paths.evidence, receipt)
+    _emit(
+        {
+            "schema": "PMW_HOST_VERIFICATION_RESULT_1",
+            "cohort_id": cohort_id,
+            "session_id": args.session_id,
+            "target_id": args.target_id,
+            "status": receipt.status.value,
+            "diagnostic_code": receipt.diagnostic_code,
+            "receipt_ref": receipt.receipt_ref,
+            "receipt_path": str(receipt_path),
+            "candidate_artifact_ref": receipt.candidate.artifact_ref,
+            "authority": "HOST_REEXECUTED_PINNED_AMF_VERIFIER",
+        }
+    )
+    return 0 if receipt.status is VerifierStatus.PASS else 1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -542,32 +749,70 @@ def build_parser() -> argparse.ArgumentParser:
     session_plan.add_argument("--cohort-id")
     session_plan.set_defaults(handler=_session_plan)
 
+    def add_launch_arguments(selected: argparse.ArgumentParser) -> None:
+        selected.add_argument("--cohort", required=True)
+        selected.add_argument(
+            "--backend", choices=("command", "pi"), required=True
+        )
+        selected.add_argument("--backend-config", type=Path, required=True)
+        selected.add_argument("--writer-authority", type=Path)
+        selected.add_argument(
+            "--readiness-scope",
+            choices=("amf-production", "runtime-only"),
+            default="amf-production",
+            help=(
+                "amf-production requires the briefing-bound locked verifier "
+                "portfolio; runtime-only asserts transport readiness only"
+            ),
+        )
+        selected.add_argument(
+            "--startup-seconds", type=_positive_number, default=60.0
+        )
+        wall = selected.add_mutually_exclusive_group()
+        wall.add_argument(
+            "--wall-seconds", type=_positive_number, default=86_400.0
+        )
+        wall.add_argument(
+            "--no-wall-limit",
+            action="store_true",
+            help="do not impose a host session wall limit",
+        )
+        selected.add_argument(
+            "--stop-grace-seconds", type=_positive_number, default=10.0
+        )
+        selected.add_argument(
+            "--context-window-tokens",
+            type=_bounded_integer(1, MAXIMUM_CONTEXT_WINDOW_TOKENS),
+            help=(
+                "set the active model context window for every session; "
+                "omitted means use the backend-declared window"
+            ),
+        )
+        selected.add_argument(
+            "--session-context-window",
+            action="append",
+            type=_session_context_window,
+            default=[],
+            metavar="SESSION_ID=TOKENS",
+            help=(
+                "override the active model context window for one exact "
+                "session; repeat for multiple sessions"
+            ),
+        )
+
     session_start = session_commands.add_parser(
         "start",
         help="explicitly run one authenticated cohort through a selected backend",
     )
-    session_start.add_argument("--cohort", required=True)
-    session_start.add_argument(
-        "--backend", choices=("command", "pi"), required=True
-    )
-    session_start.add_argument("--backend-config", type=Path, required=True)
-    session_start.add_argument("--writer-authority", type=Path)
-    session_start.add_argument(
-        "--startup-seconds", type=_positive_number, default=60.0
-    )
-    wall = session_start.add_mutually_exclusive_group()
-    wall.add_argument(
-        "--wall-seconds", type=_positive_number, default=86_400.0
-    )
-    wall.add_argument(
-        "--no-wall-limit",
-        action="store_true",
-        help="do not impose a host session wall limit",
-    )
-    session_start.add_argument(
-        "--stop-grace-seconds", type=_positive_number, default=10.0
-    )
+    add_launch_arguments(session_start)
     session_start.set_defaults(handler=_session_start)
+
+    session_preflight = session_commands.add_parser(
+        "preflight",
+        help="read-only readiness check for an exact launch configuration",
+    )
+    add_launch_arguments(session_preflight)
+    session_preflight.set_defaults(handler=_session_preflight)
 
     session_status = session_commands.add_parser(
         "status", help="read one launch without starting or resuming it"
@@ -592,6 +837,42 @@ def build_parser() -> argparse.ArgumentParser:
     )
     artifact_audit.add_argument("--world", dest="name", required=True)
     artifact_audit.set_defaults(handler=_artifact_audit)
+
+    source = commands.add_parser(
+        "source", help="materialize and audit exact core-lock source trees"
+    )
+    source_commands = source.add_subparsers(
+        dest="source_command", required=True
+    )
+    source_materialize = source_commands.add_parser(
+        "materialize",
+        help="publish an exact locked commit from a local Git object database",
+    )
+    source_materialize.add_argument("name")
+    source_materialize.add_argument(
+        "--local-repo", type=Path, required=True
+    )
+    source_materialize.set_defaults(handler=_source_materialize)
+    source_audit = source_commands.add_parser(
+        "audit", help="read-only audit of an existing managed source tree"
+    )
+    source_audit.add_argument("name")
+    source_audit.set_defaults(handler=_source_audit)
+
+    verifier = commands.add_parser(
+        "verifier", help="host-reexecute locked verifiers after settlement"
+    )
+    verifier_commands = verifier.add_subparsers(
+        dest="verifier_command", required=True
+    )
+    verifier_run = verifier_commands.add_parser(
+        "run", help="verify one workspace-relative final candidate"
+    )
+    verifier_run.add_argument("--cohort", required=True)
+    verifier_run.add_argument("--session-id", required=True)
+    verifier_run.add_argument("--target-id", required=True)
+    verifier_run.add_argument("--candidate", required=True)
+    verifier_run.set_defaults(handler=_verifier_run)
     return parser
 
 

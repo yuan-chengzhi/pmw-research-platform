@@ -26,7 +26,7 @@ adapters:
 
 | Component | Validation state | External activity in this implementation pass |
 |---|---|---|
-| Command adapter | Model-free process-group, output-capture, result and cancellation tests | Local fake workers only |
+| Command adapter | Model-free process-group, output-capture, result and cancellation tests plus one four-session/four-concurrency settled acceptance | Local deterministic workers only; zero model/network calls |
 | Pi RPC adapter | Fake RPC protocol/lifecycle tests; local Pi installation and OAuth type loaded read-only for config compatibility | No new real model/provider canary, network request or model token use |
 | Resource guard | Quiescent initial/terminal aggregate scans plus live disk-reserve tests | Local temporary trees only |
 
@@ -125,15 +125,24 @@ pmw-research-data/
   objects/sha256/                         # 63 objects
   objects/artifact-receipts/sha256/       # 63 exact receipts
   objects/imports/math-frontier-m03-closure.json
-  runs/foundation-acceptance-20260816/{plan.json,briefing.json}
+  source-cache/agent-math-frontier/c737df34.../
+  source-cache/persistent-mathematical-worlds/4880f184.../
+  runs/platform-runtime-acceptance-v2-20260816/
 ```
 
 The world has no alternates. Its exact M03 snapshot has 174 admissions; all 63
 unique artifact refs resolve in the independent CAS. Closure manifest SHA-256:
 `fbf436eec89f7c9c711faaf8a1ee490c5c699ff858d1a32ca46d0316cd9ff749`.
-The deterministic briefing contains all 14 target cards and a loss-aware index
-of every admission (530,618 bytes; SHA-256
-`dc3a2bfaaaa6740a5b0f544e30160079589143b9c6abb42e36d5992ef6b0e7a7`).
+The situation-v2 briefing contains all 14 target cards, omits predecessor
+runtime budgets as content-bound non-operative provenance, and includes a
+loss-aware index of every admission (501,644 bytes; SHA-256
+`401c39cbd5a52ac3834f6b0dfaa37095ea0da9a0ce007bd9db9c9acd5ee52d04`).
+The active zero-model cohort settled four of four sessions successfully:
+plan `d736354c87543e1d7016cac4802343459c581fe48437c3a60367c53a9b9ef683`,
+launch `83f902f0d7cd17a29d9d94fdb1f04496fb79a83f41831bad84873b4789b8090d`,
+settlement `0408d9ea9891e7929a72a2c7a0b141ff5f4ddef6f5116472a203263f3544f610`.
+Superseded plan-only bundles and the first failed worker-contract acceptance are
+retained under the corresponding `archive/model-free-*` directories.
 
 The following source set remains immutable historical experiment evidence, but
 is no longer the active continuation dependency:
@@ -191,10 +200,10 @@ Generated run sandbox profiles also contain absolute paths. They are immutable
 historical evidence and should not be rewritten. Once archived they are not an
 execution dependency; only source/config references block worktree retirement.
 The packaged source lock now binds `agent-math-frontier@c737df3` and PMW
-`@4880f18` by repository and full commit. It has no materializer yet;
-`world-kernel`, `pi-lean-tools` and Loogle remain outside that lock and the
-managed `source-cache/` is empty. Historical sandbox paths remain evidence and
-are never rewritten.
+`@4880f18` by repository, full commit and complete materialized-tree SHA-256.
+Both exact trees are present in managed `source-cache/` and pass repeatable
+full-tree audit. `world-kernel`, `pi-lean-tools` and Loogle remain outside that
+lock. Historical sandbox paths remain evidence and are never rewritten.
 
 ## Frankl local-only warning
 

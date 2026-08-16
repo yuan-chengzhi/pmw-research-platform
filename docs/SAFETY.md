@@ -39,12 +39,30 @@ can affect the whole platform. A profile may explicitly select `LIVE_LATCHED`
 for live aggregate tree checks.
 
 Provider context/request limits are job-local in this default. The platform
-does not impose a 325k/360k ceiling, compact, retry or silently change models;
-a model adapter records the backend-reported context window and returns any
+does not impose a hidden 325k/360k ceiling, retry or silently change models.
+An operator may explicitly bind a total model window per launch/per session;
+unset preserves the backend declaration. Pi applies a configured value before
+the first prompt and the host checks the reported active model window. This is
+not a cumulative token allowance or a strict pre-HTTP input gate. A model
+adapter records both the configured and backend-reported values and returns any
 provider refusal as the actual outcome. For Pi,
 `pi_reported_context_window` is runtime/model-catalog metadata, not a canary of
 the account's OAuth route near that limit. A malformed PMW proposal is rejected
 as one action.
+
+Configured Pi context and external extensions are not presently a supported
+combination. Preflight and launch reject that combination with
+`PI_CONTEXT_EXTENSION_COMPATIBILITY_UNPROVEN`; an unset policy continues to use
+the backend declaration. This fail-closed compatibility rule does not establish
+that an OAuth route will accept an input near any declared or selected window.
+
+Readiness has an advisory and an authoritative phase. `session preflight` is a
+read-only snapshot and creates no runtime claim or launch. `session start`
+rechecks backend pins and every required readiness checker while holding the
+`RuntimeClaim`, before creating runtime state, and binds the canonical public
+evidence to `launch.json`. The default `amf-production` scope also audits the
+locked source tree and briefing-bound verifier portfolio; `runtime-only` makes
+no mathematical-apparatus assertion.
 
 `strict-experiment` retains historical profile metadata and selects live
 aggregate scans, but the generic guard still does not enforce its legacy
@@ -72,6 +90,22 @@ The policy module remains free of process-control code. The command adapter
 keeps draining through cleanup. Its canonical backend config and the host's
 single set of startup/wall/stop lifecycle limits are bound into `launch.json`,
 so output and lifecycle treatment are visible and each has one authority.
+
+The Pi example intentionally has `tools: []` and `extensions: []`. Explicitly
+enabling a Pi built-in changes the threat surface: built-in `bash` runs with the
+host account's filesystem and network authority, so filtered environment
+variables and process groups do not stop it from probing other readable paths.
+The adapter bounds retained RPC frame/stderr evidence, but it does not yet
+provide a bounded-output proxy between a built-in tool and Pi's model context.
+Consequently a large tool result may consume the configured active context
+window even when retained transport evidence remains bounded.
+
+The AMF verifier is host-authoritative but currently post-settlement only. It
+captures a workspace-relative candidate into CAS and re-executes a verifier
+from the audited locked source, with bounded output/time, stripped credentials
+and a top-level Python socket audit denial. This is not kernel network
+isolation, and no verifier tool is exposed live to an agent. Likewise, the
+generic runtime currently exposes no live PMW read/query/peer-update tool plane.
 
 These controls are operational guardrails, not a hostile-code OS sandbox.
 Process groups and filtered environments do not prevent a deliberately

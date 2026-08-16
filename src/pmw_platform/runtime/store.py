@@ -32,6 +32,11 @@ from .contracts import (
     RuntimeContractError,
     runtime_host_policy_value,
 )
+from .context import (
+    CONTEXT_WINDOW_SEMANTICS,
+    ContextWindowControl,
+    ContextWindowPolicy,
+)
 
 
 RUNTIME_LAUNCH_SCHEMA = "PMW_RUNTIME_LAUNCH_1"
@@ -68,6 +73,10 @@ _LAUNCH_FIELDS = frozenset({
     "concurrency",
     "session_ids",
     "limits",
+    "context_window_policy",
+    "backend_context_window_control",
+    "required_readiness",
+    "required_readiness_sha256",
     "host_policy",
 })
 _RECEIPT_FIELDS = frozenset({
@@ -89,6 +98,7 @@ _RECEIPT_FIELDS = frozenset({
     "publications",
     "error",
     "resource_guard",
+    "context_window",
 })
 _STOP_PROOF_FIELDS = frozenset({
     "stopped",
@@ -136,6 +146,12 @@ _RESOURCE_EVENT_FIELDS = frozenset({
     "observed",
     "limits",
     "detail",
+})
+_RECEIPT_CONTEXT_WINDOW_FIELDS = frozenset({
+    "semantics",
+    "configured_tokens",
+    "backend_control",
+    "strict_pre_http_input_gate",
 })
 _SETTLEMENT_FIELDS = frozenset({
     "schema",
@@ -783,6 +799,7 @@ class RuntimeStore:
             "core_lock_sha256",
             "backend_sha256",
             "publication_sha256",
+            "required_readiness_sha256",
         ):
             digest = launch.get(label)
             if type(digest) is not str or _SHA256.fullmatch(digest) is None:
@@ -890,8 +907,79 @@ class RuntimeStore:
             or wall <= 0
         ):
             _fail("MALFORMED_RUNTIME_LAUNCH", "limits.session_wall_seconds")
+
+        raw_context = launch.get("context_window_policy")
+        if type(raw_context) is not dict or set(raw_context) != {
+            "schema",
+            "semantics",
+            "default_tokens",
+            "session_overrides",
+            "effective_sessions",
+            "unset_semantics",
+        }:
+            _fail("MALFORMED_RUNTIME_LAUNCH", "context_window_policy")
+        raw_overrides = raw_context.get("session_overrides")
+        if type(raw_overrides) is not list:
+            _fail("MALFORMED_RUNTIME_LAUNCH", "context_window_policy")
+        overrides: dict[str, int] = {}
+        for row in raw_overrides:
+            if type(row) is not dict or set(row) != {
+                "session_id",
+                "context_window_tokens",
+            }:
+                _fail("MALFORMED_RUNTIME_LAUNCH", "context_window_policy")
+            override_session = row.get("session_id")
+            if type(override_session) is not str or override_session in overrides:
+                _fail("MALFORMED_RUNTIME_LAUNCH", "context_window_policy")
+            overrides[override_session] = row.get("context_window_tokens")  # type: ignore[assignment]
+        try:
+            rebuilt_context = ContextWindowPolicy(
+                default_tokens=raw_context.get("default_tokens"),  # type: ignore[arg-type]
+                session_overrides=overrides,
+            )
+            context_control = ContextWindowControl(
+                launch.get("backend_context_window_control")
+            )
+        except (TypeError, ValueError) as error:
+            raise RuntimeStoreError(
+                "MALFORMED_RUNTIME_LAUNCH", "context_window_policy"
+            ) from error
+        if (
+            rebuilt_context.bind(session_ids) != raw_context
+            or (
+                rebuilt_context.configured
+                and context_control
+                is not ContextWindowControl.NATIVE_MODEL_WINDOW
+            )
+        ):
+            _fail("MALFORMED_RUNTIME_LAUNCH", "context_window_policy")
         if launch.get("host_policy") != runtime_host_policy_value():
             _fail("MALFORMED_RUNTIME_LAUNCH", "host_policy")
+        readiness = launch.get("required_readiness")
+        if (
+            type(readiness) is not dict
+            or set(readiness) != {"schema", "checks"}
+            or readiness.get("schema") != "PMW_RUNTIME_REQUIRED_READINESS_1"
+            or type(readiness.get("checks")) is not list
+            or len(readiness["checks"]) > 22  # type: ignore[arg-type]
+            or hashlib.sha256(canonical_json(readiness)).hexdigest()
+            != launch.get("required_readiness_sha256")
+        ):
+            _fail("MALFORMED_RUNTIME_LAUNCH", "required_readiness")
+        readiness_names: set[str] = set()
+        for row in readiness["checks"]:  # type: ignore[index]
+            if (
+                type(row) is not dict
+                or set(row) != {"name", "evidence"}
+                or type(row.get("name")) is not str
+                or not row["name"]
+                or len(row["name"].encode("utf-8")) > 64
+                or row["name"] in readiness_names
+                or type(row.get("evidence")) is not dict
+                or len(canonical_json(row["evidence"])) > 2_048
+            ):
+                _fail("MALFORMED_RUNTIME_LAUNCH", "required_readiness")
+            readiness_names.add(row["name"])
 
     def _runtime_directories(self) -> None:
         _safe_directory(
@@ -1105,6 +1193,26 @@ class RuntimeStore:
         _validate_resource_guard(
             value.get("resource_guard"), session_id=session_id
         )
+        context_window = value.get("context_window")
+        launch_context = launch.get("context_window_policy")
+        effective_tokens: object = None
+        if type(launch_context) is dict:
+            effective = launch_context.get("effective_sessions")
+            if type(effective) is list:
+                for row in effective:
+                    if type(row) is dict and row.get("session_id") == session_id:
+                        effective_tokens = row.get("context_window_tokens")
+                        break
+        if (
+            type(context_window) is not dict
+            or set(context_window) != _RECEIPT_CONTEXT_WINDOW_FIELDS
+            or context_window.get("semantics") != CONTEXT_WINDOW_SEMANTICS
+            or context_window.get("configured_tokens") != effective_tokens
+            or context_window.get("backend_control")
+            != launch.get("backend_context_window_control")
+            or context_window.get("strict_pre_http_input_gate") is not False
+        ):
+            _fail("MALFORMED_SESSION_RECEIPT", f"context_window {session_id}")
         status = value["status"]
         outcome = value.get("outcome")
         contribution_count = (

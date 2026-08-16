@@ -12,8 +12,16 @@ Status: **generic session runtime implemented; M04 remains explicitly frozen**.
 | M01–M03 experiment evidence | archived frontier campaign |
 
 The packaged lock at `src/pmw_platform/locks/core-lock.json` binds the first two
-repositories by URL and full commit. It is a validated identity lock, not yet a
-source materializer; `source-cache/` remains future adapter work.
+repositories by URL and full commit. The managed source materializer resolves
+those exact commits from an explicitly selected local Git object database; it
+does not fetch a branch tip or use a dirty worktree as verifier authority. It
+publishes the complete tree under `source-cache`, records a canonical manifest,
+and audits the full tree digest against the lock rather than trusting a
+self-authored manifest. `source materialize` is the explicit local publication
+step; `source audit` is the read-only repeatable check. Runtime authentication
+then loads `pmw_r2` directly from the audited tree's `src` directory. A wheel or
+editable checkout may exist for development, but neither its parent `.git` nor
+an old campaign worktree is runtime authority.
 
 ## Long-lived world
 
@@ -31,7 +39,9 @@ core still owns linear Git CAS, visibility, idempotency and audit semantics.
 `build_mathematical_situation` produces the exact `briefing.json` used by a
 cohort:
 
-- every target card is included in full;
+- every target card's mathematical content is included; predecessor-campaign
+  `budget_contract` fields are omitted from operative problem content and
+  represented separately by exact field/hash/byte provenance;
 - every non-card admission appears once in a global record index as a bounded
   mathematical projection, parent refs, content hash, artifact refs and exact
   `world.get` retrieval key; problems join to it by admission ref;
@@ -39,9 +49,10 @@ cohort:
   record or as truth ranking;
 - the whole file is bound to the plan by SHA-256 and the exact snapshot ref.
 
-The settled M03 briefing is about 519 KiB for 14 problems and 174 admissions.
-A 16 MiB serialization guard catches a world that needs a reviewed checkpoint
-instead of silently truncating history.
+The current M03-derived world has 14 targets and remains comfortably below the
+16 MiB serialization guard. Exact briefing bytes and their digest are plan-
+bound; the guard catches a world that needs a reviewed checkpoint instead of
+silently truncating history.
 
 ## Session and cohort identity
 
@@ -64,6 +75,18 @@ starts no more than `concurrency` backend handles. Every session receives
 private `input/workspace/cache/evidence` roots, an immutable terminal receipt,
 and one ordered cohort settlement.
 
+Readiness also has one launch-bound identity. `session preflight` produces an
+advisory read-only report without claiming the cohort, creating a runtime tree,
+or starting a backend. `session start` then acquires the `RuntimeClaim`, repeats
+the mutable backend-pin and required apparatus checks before creating the
+launch, and binds their canonical public evidence plus digest into
+`launch.json` and every invocation. This second check is authoritative; a
+previous preflight PASS cannot be replayed across source or runtime drift.
+`amf-production` is the default readiness scope and closes the briefing against
+the locked AMF portfolio. Explicit `runtime-only` asserts only generic
+transport readiness and must not be reported as mathematical-apparatus
+readiness.
+
 The backend protocol is deliberately only `identity`, `start`, `wait` and
 idempotent `stop`. The host alone decides `SUCCEEDED/FAILED/CANCELLED/UNKNOWN`.
 `CANCELLED` requires either no start or a positive cleanup proof; `UNKNOWN`
@@ -81,6 +104,22 @@ not carry competing wall/stop values. `stop()` must remain idempotent and close
 all adapter-owned work before returning. The trusted adapter bounds each
 graceful, forced-cleanup and evidence-closure phase; the host never writes a
 settlement after timing out and abandoning a hidden cleanup task.
+
+Model context is a separate immutable launch treatment. `ContextWindowPolicy`
+has an optional cohort default and exact session overrides; unset means the
+backend-declared window. A capable backend must report `NATIVE_MODEL_WINDOW`,
+receive the selected value in `SessionRequest`, and verify it before useful
+work. Pi applies it to the active model object, so Pi's native budgeting,
+compaction threshold and overflow recognition see the chosen total window.
+This is neither cumulative session token consumption nor a strict estimate-
+then-block gate for provider input. Backends without a model window reject a
+configured policy before a runtime directory is created.
+
+For the current Pi implementation, a configured window is compatible only
+with an empty external-extension list. Combining a configured window with any
+external Pi extension fails before launch with
+`PI_CONTEXT_EXTENSION_COMPATIBILITY_UNPROVEN`. Leaving the policy unset keeps
+the backend-declared window and does not make a provider-route capacity claim.
 
 ## Trusted publish boundary
 
@@ -129,20 +168,62 @@ exit with a surviving group is cleaned and reported as failure. This is
 cooperative process-group containment, not an OS sandbox.
 
 The Pi RPC adapter pins the Node executable, Pi entrypoint, complete Pi
-installation tree, settings and explicit extension entry files. It disables
-built-in tools, sends one generic research prompt, and observes Pi-native events without
-host retry, compaction, context downcap or model fallback. The adapter does not
-deliberately serialize credential values or paths into public identity. Raw
+installation tree, settings and explicit extension entry files. A sorted
+allowlist may enable Pi's built-in workspace tools; custom tools still require
+explicit pinned extensions. It sends one generic research prompt and observes
+Pi-native events without host retry, implicit context downcap or model fallback.
+The shipped example starts from `tools: []` and `extensions: []`; no workspace
+tool is implicitly enabled. When a configured context window is selected,
+external extensions are currently rejected as described above. The adapter
+does not deliberately serialize credential values or paths into public identity. Raw
 bounded child frames and stderr remain a trusted Pi/redaction boundary: a child
-error could still echo data into evidence. Protocol/lifecycle tests use fake RPC;
-the local installation and OAuth *type* have only been loaded read-only for
-compatibility. No new real model/provider canary was run. In particular,
+error could still echo data into evidence. Protocol/lifecycle tests use fake
+RPC. One zero-provider local smoke started pinned Pi and issued only
+`get_state`; it confirmed a selected 400000 window on the active model object
+without changing settings, sending a prompt/provider request, refreshing OAuth,
+making a network call or consuming model tokens. No real model/provider canary
+was run. In particular,
 `pi_reported_context_window` is not evidence that the account's OAuth route
 accepted a request near that size.
 
 Both adapters are trusted transports for managed cooperative processes. The
 generic runtime does not claim to contain hostile code at the OS boundary; a
 stronger sandbox/VM may implement the same four-method protocol.
+
+In particular, Pi built-ins execute with the host account's permissions. An
+explicitly enabled `bash` may inspect host-readable paths or use the network;
+the prompt's instruction not to inspect credentials is cooperative, not
+containment. Pi RPC frame and stderr capture are bounded as transport evidence,
+but the adapter does not yet proxy and project each built-in tool result before
+Pi puts it into model context. A very large `bash` result can therefore consume
+the active context window. `tools: []` is the present least-privilege baseline,
+not an assertion that the same safety holds after enabling built-ins.
+
+## AMF apparatus and verifier lifecycle
+
+The `amf-production` readiness checker derives every target/verifier binding
+from the authenticated briefing, then cross-checks it against the full locked
+`agent-math-frontier` portfolio, target cards, candidate schemas, registry and
+verifier manifests. It audits the materialized source before launch, executes
+no verifier and makes no model or network request during readiness.
+
+Verifier execution is currently an explicit post-settlement host operation.
+`verifier run` accepts a settled session, a briefing-bound target ID and a
+workspace-relative candidate path. The host no-follow captures stable candidate
+bytes into the artifact CAS, stages the pinned verifier source privately,
+re-executes the verifier with bounded time/output and persists a
+content-addressed receipt under the session evidence tree. The verifier runner
+removes credentials and installs a top-level Python socket audit denial, but it
+does not claim kernel-level network isolation.
+
+There is no agent-facing live verifier tool in this version, and there is no
+live PMW read/query/peer-update coordination plane comparable to the historical
+M01–M03 apparatus. The runtime can carry an authenticated static briefing and an
+optional end-of-session publisher; those facts must not be presented as a full
+interactive mathematical-research platform. A session with explicitly enabled
+`read`/`bash` may inspect the readiness-bound source tree and run a verifier as
+a self-check, but only the later host execution produces an authoritative
+verifier receipt.
 
 ## Resource and safety enforcement
 
@@ -183,6 +264,7 @@ schema migration.
 
 - no claim that process-group control equals OS containment;
 - no automatic model/OAuth canary, retry, compaction or context ceiling;
+- no live agent-facing verifier or PMW coordination tool plane;
 - no automatic resume or reuse of a crashed/settled launch; cross-system
   publication gaps require explicit reconciliation;
 - no new M04/M05 treatment, ballot or all-agent barrier;
@@ -191,8 +273,10 @@ schema migration.
   installed host package; archival reproduction must retain the repository
   commit alongside runtime evidence;
 - explicit Pi extension entry files are pinned, but their transitive imports,
-  package dependencies and external verifier binaries are not discovered
-  automatically; a tool-enabled production cohort needs a reviewed,
-  adapter-specific dependency manifest in public identity;
+  package dependencies and external binaries are not discovered automatically;
+  moreover, configured context windows currently reject every external Pi
+  extension. A future extension-enabled production cohort needs both a
+  reviewed dependency manifest and a reviewed context-mutation compatibility
+  design;
 - custom asynchronous publishers must supply their own bounded, cancellable
   transport; the built-in PMW publisher is synchronous.

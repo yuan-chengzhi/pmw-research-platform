@@ -22,6 +22,7 @@ from .store import (
     ResearchWorld,
     ResearchWorldError,
     WorldAdmission,
+    activate_pmw_core,
     load_writer_authority,
 )
 from .situation import (
@@ -48,6 +49,7 @@ __all__ = [
     "ResearchWorld",
     "ResearchWorldError",
     "WorldAdmission",
+    "activate_pmw_core",
     "build_legacy_frontier_view",
     "build_mathematical_situation",
     "load_writer_authority",

@@ -9,6 +9,7 @@ import pytest
 from pmw_platform.runtime import auth
 from pmw_platform.runtime.auth import RuntimeAuthenticationError
 from pmw_platform.sessions import CohortPlan
+from pmw_platform.source_materializer import SourceMaterializerError
 
 
 SNAPSHOT = "snapshot/sha256/" + "a" * 64
@@ -80,10 +81,10 @@ def _install_valid_bundle(
         lambda *_args, **_kwargs: SimpleNamespace(sha256=state["core_sha"]),
     )
 
-    def validate_source(_lock: object) -> None:
+    def validate_source(_root: Path, _lock: object) -> None:
         state["source_checks"] = int(state["source_checks"]) + 1
 
-    monkeypatch.setattr(auth, "_validate_loaded_pmw_source", validate_source)
+    monkeypatch.setattr(auth, "_activate_locked_pmw_source", validate_source)
 
     class Registry:
         def __init__(self, root: Path) -> None:
@@ -233,73 +234,57 @@ def test_authentication_rebuilds_the_exact_frozen_briefing(
     assert caught.value.code == "BRIEFING_RECONSTRUCTION_MISMATCH"
 
 
-def test_loaded_pmw_source_rejects_drift_in_importable_package(
+def test_managed_pmw_source_is_audited_then_activated(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    checkout = tmp_path / "pmw-checkout"
-    package = checkout / "pmw_r2"
-    package.mkdir(parents=True)
-    (checkout / ".git").mkdir()
-    origin = package / "__init__.py"
-    origin.write_text("")
-    commit = "1" * 40
-    lock = SimpleNamespace(
-        source=lambda _name: SimpleNamespace(commit=commit),
-    )
+    data_root = tmp_path / "data"
+    tree = data_root / "source-cache" / "pmw" / "tree"
+    tree.mkdir(parents=True)
+    lock = object()
+    observed: dict[str, object] = {}
+
+    class Materializer:
+        def __init__(self, root: Path, *, core_lock: object) -> None:
+            observed["constructor"] = (root, core_lock)
+
+        def audit(self, name: str) -> object:
+            observed["audit"] = name
+            return SimpleNamespace(tree_path=tree, tree_sha256="1" * 64)
+
+    monkeypatch.setattr(auth, "SourceMaterializer", Materializer)
     monkeypatch.setattr(
-        auth.importlib.util,
-        "find_spec",
-        lambda _name: SimpleNamespace(origin=str(origin)),
+        auth,
+        "activate_pmw_core",
+        lambda selected, *, tree_sha256: observed.update(
+            activation=(selected, tree_sha256)
+        ),
     )
-    results = iter(
-        (
-            SimpleNamespace(returncode=0, stdout=(commit + "\n").encode()),
-            SimpleNamespace(returncode=1, stdout=b""),
-            SimpleNamespace(returncode=0, stdout=b""),
-        )
-    )
-    monkeypatch.setattr(auth.subprocess, "run", lambda *_args, **_kwargs: next(results))
+
+    auth._activate_locked_pmw_source(data_root, lock)  # type: ignore[arg-type]
+
+    assert observed == {
+        "constructor": (data_root, lock),
+        "audit": "persistent-mathematical-worlds",
+        "activation": (tree, "1" * 64),
+    }
+
+
+def test_managed_pmw_source_audit_failure_is_typed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Materializer:
+        def __init__(self, _root: Path, *, core_lock: object) -> None:
+            pass
+
+        def audit(self, _name: str) -> object:
+            raise SourceMaterializerError("SOURCE_CACHE_CONFLICT")
+
+    monkeypatch.setattr(auth, "SourceMaterializer", Materializer)
 
     with pytest.raises(RuntimeAuthenticationError) as caught:
-        auth._validate_loaded_pmw_source(lock)  # type: ignore[arg-type]
-    assert caught.value.code == "PMW_CORE_IDENTITY_MISMATCH"
+        auth._activate_locked_pmw_source(tmp_path, object())  # type: ignore[arg-type]
 
-
-def test_loaded_pmw_source_ignores_unrelated_checkout_changes(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    checkout = tmp_path / "pmw-checkout"
-    package = checkout / "src" / "pmw_r2"
-    package.mkdir(parents=True)
-    (checkout / ".git").mkdir()
-    origin = package / "__init__.py"
-    origin.write_text("")
-    commit = "2" * 40
-    lock = SimpleNamespace(
-        source=lambda _name: SimpleNamespace(commit=commit),
-    )
-    monkeypatch.setattr(
-        auth.importlib.util,
-        "find_spec",
-        lambda _name: SimpleNamespace(origin=str(origin)),
-    )
-    commands: list[list[str]] = []
-
-    def run(command: list[str], **_kwargs: object) -> object:
-        commands.append(command)
-        if "rev-parse" in command:
-            return SimpleNamespace(returncode=0, stdout=(commit + "\n").encode())
-        # A dirty README is intentionally not queried.  Both package-scoped
-        # checks report that src/pmw_r2 is still identical to HEAD.
-        return SimpleNamespace(returncode=0, stdout=b"")
-
-    monkeypatch.setattr(auth.subprocess, "run", run)
-
-    auth._validate_loaded_pmw_source(lock)  # type: ignore[arg-type]
-
-    assert len(commands) == 3
-    assert commands[1][-1] == "src/pmw_r2"
-    assert commands[2][-1] == "src/pmw_r2"
-    assert all("status" not in command for command in commands)
+    assert caught.value.code == "PMW_CORE_IDENTITY_UNPROVEN"
+    assert caught.value.detail == "SOURCE_CACHE_CONFLICT"

@@ -20,8 +20,12 @@
 ```text
 canonical plan + briefing
           │ authenticate profile / core / world / artifacts
+read-only preflight ───────┘          （advisory；不创建 runtime）
           ▼
-       launch.json                 （plan + backend + publish + limits）
+   RuntimeClaim 内重做 required readiness
+          │ bind source / verifier portfolio / backend pins
+          ▼
+       launch.json          （plan + backend + publish + limits + context + readiness）
           │ fixed concurrency
           ├── session 0001 ── backend ── host publish ── receipt
           ├── session 0002 ── backend ── host publish ── receipt
@@ -66,16 +70,18 @@ Pi RPC 或其他 backend 不会改变数学记录的身份边界。
   TERM → grace → KILL，并报告能否证明进程组已消失。它用于无模型的端到端
   验收；平台不会把测试 command 暗中替换为模型请求。
 - **Pi RPC backend** 向内容固定的 Pi 安装发送一次通用 research prompt，等待
-  `agent_settled`，关闭内置工具，只加载显式 pin 的 extension 入口。host 不替 Pi
-  做 retry、compaction、模型降档或 context downcap。adapter 不把 OAuth
+  `agent_settled`，只启用配置中精确列出的内置工具和显式 pin 的 extension 入口。
+  示例配置默认是 `tools: []` 与 `extensions: []`；工具必须由操作者显式开启。host
+  不替 Pi 做 retry、模型降档或隐式 context downcap。adapter 不把 OAuth
   credential 值或路径主动序列化进公开 identity；但 Pi 子进程的有界 raw
   frame/stderr evidence 仍是 trusted/redaction boundary，不能假定第三方错误消息
   永远不会回显敏感内容。
 
-Pi adapter 目前通过 fake RPC 覆盖协议与生命周期，并只读加载过本机 Pi 安装及
-OAuth 类型以检查配置兼容性；没有执行新的真实模型/provider canary，也没有发起
-网络请求或消耗模型 token。`pi_reported_context_window` 只是 Pi 运行时/模型目录
-报告的值，不能解释为该账号 OAuth 路由已在接近该上限处实测成功。
+Pi adapter 通过 fake RPC 覆盖协议与生命周期；另有一次 zero-provider 本机 smoke
+真正启动了 pinned Pi，但只发送 `get_state`，确认 400000 已进入 active model object
+且 settings 未改变，未发送 prompt/provider 请求、未刷新 OAuth、未联网或消耗模型
+token。它不是模型/provider canary。`pi_reported_context_window` 只是 Pi 运行时/模型
+目录报告的值，不能解释为该账号 OAuth 路由已在接近该上限处实测成功。
 
 backend config 可以使用普通缩进 JSON；loader 会拒绝重复 key、非有限数值、未知
 字段与越界值，再把有效内容 canonicalize 后纳入 identity。安全占位示例见
@@ -87,6 +93,12 @@ command backend 的边界是“受管但协作式的进程组”，不是 OS san
 宿主环境中的 token/API key，但同一账户下的恶意程序仍可能主动探测宿主可读路径；
 因此它适合受信任的本地 worker、测试和被更强 sandbox 包裹的执行器。
 
+Pi 内置工具也处在协作式边界。显式开启 `bash` 后，它使用宿主账户权限，可能读取
+workspace 之外的路径或发起网络访问。当前 adapter 只对 Pi RPC frame/stderr 证据做
+总量限制，尚没有介于内置 `bash` 与模型之间的 bounded-output projection；超大工具
+结果仍可能消耗 active context。因此 `tools: []` 是当前最小权限起点，开启 `bash`
+是明确的能力/风险决策，不是默认保证。
+
 ## 边界，而不是历史仪式
 
 平台不继承 M01–M03 的 treatment、wave authorization、ballot 或 target-specific
@@ -95,10 +107,20 @@ command backend 的边界是“受管但协作式的进程组”，不是 OS san
 磁盘余量；它限制 workspace/cache 的总字节、entry 数与深度，按 inode 去重
 hardlink 字节，不跟随 symlink，不执行单文件或“出现 hardlink 即击杀”规则。
 
-平台层也不再自设 325k/360k 一类模型 context ceiling。模型 backend 应使用并
-记录 provider 实际公开的 context window 与 usage；若 provider 拒绝请求，应如实
-失败，而不是自动 compact、重试、静默降档或伪称已使用更大的窗口。command
-backend 本身没有模型 context 概念。
+平台层没有隐藏的 325k/360k ceiling。每次 launch 可以不设值（默认，沿用 backend
+声明的模型窗口），也可以用 `--context-window-tokens` 为全部 session 选择总 context
+window，并用可重复的 `--session-context-window SESSION_ID=TOKENS` 精确覆盖某个
+session。Pi 在首个 prompt 前原生应用并回读核对这个值；它影响 Pi 的输出预算、
+compaction 与 overflow 判断，但不是累计 token 配额，也不是声称 OAuth 路由已做过
+近上限 canary 的严格 pre-HTTP input gate。provider 拒绝仍应如实失败，不会自动
+重试或静默降档。command backend 没有模型 context 概念，因此配置 context 会在
+创建 runtime 前被拒绝。
+
+当 Pi launch 显式设置 context window 时，当前实现还要求 `extensions: []`；任何
+外部 Pi extension 与这个 context mutation 的组合都会在启动前以
+`PI_CONTEXT_EXTENSION_COMPATIBILITY_UNPROVEN` 拒绝。这是当前组合的兼容性边界，
+不是对 extension 的通用禁止。若必须加载 extension，应暂时留空 context 设置并沿用
+backend-declared window，或先完成独立的兼容性设计与验收。
 
 generic runtime 是生命周期与证据边界，不是面向 hostile code 的 OS sandbox。
 另外，PMW admission 与本地 receipt 分属两个 durable system：若进程恰好在
@@ -110,20 +132,34 @@ admission 成功后、receipt 落盘前崩溃，必须由操作者按 PMW admiss
 | 能力 | 保证 |
 |---|---|
 | World | 注册、精确 snapshot 读取、delta、单条回读、完整 PMW audit |
-| Briefing | 目标问题全文 + 当前研究状态的有界投影、内容哈希和精确回读引用 |
+| Briefing | 目标问题数学内容 + 非生效历史 budget 的显式 omission provenance + 当前研究状态的有界投影与精确回读引用 |
 | Artifacts | 独立 SHA-256 CAS；历史 store 无链接复制；world 引用闭包审计 |
+| Locked source | 从操作者指定的本地 Git object database 物化 core-lock 精确 commit；完整 tree digest 可重审 |
 | Plan authentication | canonical plan、briefing、profile、core lock、world ancestry 与 artifact closure 一起认证 |
+| Readiness | `preflight` 只读预检；`start` 在 RuntimeClaim 内重做 backend/source/apparatus 检查并把证据绑定进 launch |
 | Backend contract | 公开身份无凭证值；请求身份由 host 固定；结果有界且无 session 身份 |
 | Publish API | launch 明示 `DISABLED`/`PMW_BOUND`；host 注入 `SessionSpec` 并在写回前验证 artifact 引用 |
+| Verifier | 结算后由 host 捕获 candidate 到 CAS、重执行 briefing-bound 的 pinned AMF verifier，并持久化不可变 receipt |
 | Safety | lifecycle 单一权威、有界输出、聚合资源 guard、独立工作/缓存路径；不把正常研究行为当入侵 |
 
-基础包可以独立安装。需要读写 PMW world 时，再暴露 source lock 指定的核心，
-或在有权读取该仓库的环境中安装 `.[pmw]`。公共 CI 不持有跨私有仓库凭证，
-因此依赖真实 PMW 的连续性用例单独运行；runtime 契约与 command 验收不需要模型。
+基础包可以独立安装。需要读写 PMW world 时，先从操作者指定的本地 Git object
+database 把 source lock 中的 PMW commit 物化进 managed `source-cache`；CLI 会在完整
+tree audit 后直接从该只读树加载 `pmw_r2`，不要求旧工作树、editable install 或
+父目录 `.git` 继续存在。`.[pmw]` 只方便直接使用上游 Python 包，不是 runtime 的
+source identity。公共 CI 不持有跨私有仓库凭证，因此依赖真实 PMW 的连续性用例
+单独运行；runtime 契约与 command 验收不需要模型。
 
 ## 操作面
 
 ```bash
+# 先从已审查的本地 Git object database 物化 core-lock 精确源码；不会 fetch
+pmw-research source materialize agent-math-frontier \
+  --local-repo ~/Documents/agent-math-frontier
+pmw-research source materialize persistent-mathematical-worlds \
+  --local-repo ~/Documents/persistent-mathematical-worlds
+pmw-research source audit agent-math-frontier
+pmw-research source audit persistent-mathematical-worlds
+
 # 注册已经存在的 PMW world
 pmw-research world add math-frontier \
   --repo ~/Documents/pmw-research-data/worlds/math-frontier.git \
@@ -141,16 +177,44 @@ pmw-research session plan \
   --world math-frontier --count 8 --concurrency 4 \
   --profile research-default
 
-# 显式运行；backend config 是独立的 launch identity，不进入数学 plan
-# 先复制 example，并替换其中的安全本地绝对路径
+# 先复制 example 并替换其中已审查 worker 的绝对路径；再只读预检精确 launch 配置
+# preflight 不建 runtime、不启动 backend
+# amf-production 是默认 scope；runtime-only 只表示 transport 就绪
+pmw-research session preflight \
+  --cohort cohort-... --backend command \
+  --backend-config ./examples/command-backend.json \
+  --startup-seconds 60 --wall-seconds 86400 --stop-grace-seconds 10
+
+# 显式运行；start 会在 launch claim 内重做 required readiness 检查
 pmw-research session start \
   --cohort cohort-... --backend command \
   --backend-config ./examples/command-backend.json \
   --startup-seconds 60 --wall-seconds 86400 --stop-grace-seconds 10
 
+# Pi/account 路由希望采用约 400k 总窗口时；值会冻结进 launch.json
+pmw-research session start \
+  --cohort cohort-... --backend pi \
+  --backend-config ./pi-backend.json \
+  --context-window-tokens 400000 \
+  --session-context-window cohort-...-session-0002=360000
+
 # 纯读取，不启动、不恢复任何进程
 pmw-research session status --cohort cohort-...
+
+# 仅对已结算 session 的 workspace-relative candidate 做 host 复验
+pmw-research verifier run \
+  --cohort cohort-... --session-id cohort-...-session-0001 \
+  --target-id aim-60-first-prime --candidate relative/path/to/candidate.json
 ```
+
+`session preflight` 的 PASS 是建议性快照，不是启动授权。真正的 `start` 获取
+RuntimeClaim 后会重做可变的 backend pin、source 和 apparatus 检查，然后才创建
+`launch.json`；其 canonical 公开证据与哈希会进入 launch 并下发到 session invocation。
+
+当前产物应准确理解为“通用 cohort/runtime production candidate”。它已有结算后的
+host verifier，但尚无 agent-facing 的 live verifier tool，也没有 M01–M03 那种实时
+PMW read/query/peer-update 协调 tool plane。这些是后续独立能力层，不能从当前
+runtime 验收中推导出来。
 
 运行数据默认位于
 `~/Documents/pmw-research-data/{worlds,runs,objects,source-cache,archive}`，不进入

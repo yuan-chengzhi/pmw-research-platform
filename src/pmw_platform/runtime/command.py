@@ -37,6 +37,7 @@ from .contracts import (
     SessionRequest,
     StopProof,
 )
+from .context import ContextWindowControl
 from .safety import BoundedCaptureAccumulator, CaptureLimits, CaptureSnapshot
 from ..world.records import canonical_json
 
@@ -1148,6 +1149,15 @@ class CommandBackend:
     @property
     def identity(self) -> BackendIdentity:
         return self._identity
+
+    @property
+    def context_window_control(self) -> ContextWindowControl:
+        return ContextWindowControl.NOT_APPLICABLE
+
+    def verify_runtime(self) -> None:
+        """Recheck the pinned executable without starting a process."""
+
+        self._config.verify_executable()
 
     async def start(self, request: SessionRequest) -> _RunningCommandSession:
         if not isinstance(request, SessionRequest):

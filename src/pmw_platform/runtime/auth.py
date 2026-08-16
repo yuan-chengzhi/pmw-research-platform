@@ -4,19 +4,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
-import importlib.util
 import json
 import os
 from pathlib import Path
-import subprocess
 
 from ..artifacts import ArtifactStore, ArtifactStoreError
 from ..config import ConfigError, WorldRegistration, WorldRegistry
 from ..sessions import CohortPlan, PlanStoreError, load_briefing, load_plan
 from ..source_lock import CoreLock, SourceLockError, load_core_lock
+from ..source_materializer import SourceMaterializer, SourceMaterializerError
 from ..world import (
     ResearchWorld,
     ResearchWorldError,
+    activate_pmw_core,
     build_mathematical_situation,
 )
 from .safety import SafetyProfile, SafetyProfileError, load_named_profile
@@ -86,90 +86,23 @@ def _artifact_references(briefing: bytes) -> tuple[str, ...]:
     return tuple(sorted(references))
 
 
-def _validate_loaded_pmw_source(core_lock: CoreLock) -> None:
-    """Bind the imported PMW package code to the locked Git commit.
+def _activate_locked_pmw_source(data_root: Path, core_lock: CoreLock) -> None:
+    """Audit and load PMW from the managed core-lock source materialization."""
 
-    Documentation or other unrelated files in the checkout are deliberately
-    outside this check.  Only tracked and untracked files under the package
-    that Python can import are allowed to block a launch.
-    """
-
-    source = core_lock.source("persistent-mathematical-worlds")
-    spec = importlib.util.find_spec("pmw_r2")
-    origin = None if spec is None else spec.origin
-    if type(origin) is not str:
-        raise RuntimeAuthenticationError("PMW_CORE_UNAVAILABLE")
-    selected = Path(origin).resolve(strict=True)
-    candidates = [selected.parent, *selected.parents]
-    root = next((path for path in candidates if (path / ".git").exists()), None)
-    if root is None:
-        raise RuntimeAuthenticationError(
-            "PMW_CORE_IDENTITY_UNPROVEN", "loaded package is not in a Git checkout"
-        )
     try:
-        package_relative = selected.parent.relative_to(root)
-    except ValueError as error:
-        raise RuntimeAuthenticationError("PMW_CORE_IDENTITY_UNPROVEN") from error
-    environment = {"PATH": os.defpath, "LANG": "C", "LC_ALL": "C"}
-    try:
-        completed = subprocess.run(
-            ["git", "-C", str(root), "rev-parse", "HEAD"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-            timeout=10,
-            env=environment,
+        materialized = SourceMaterializer(
+            data_root, core_lock=core_lock
+        ).audit("persistent-mathematical-worlds")
+        activate_pmw_core(
+            materialized.tree_path,
+            tree_sha256=materialized.tree_sha256,
         )
-        package_diff = subprocess.run(
-            [
-                "git",
-                "-C",
-                str(root),
-                "diff",
-                "--quiet",
-                "HEAD",
-                "--",
-                str(package_relative),
-            ],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-            timeout=10,
-            env=environment,
-        )
-        package_untracked = subprocess.run(
-            [
-                "git",
-                "-C",
-                str(root),
-                "ls-files",
-                "--others",
-                "--exclude-standard",
-                "--",
-                str(package_relative),
-            ],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-            timeout=10,
-            env=environment,
-        )
-    except (OSError, subprocess.SubprocessError) as error:
-        raise RuntimeAuthenticationError("PMW_CORE_IDENTITY_UNPROVEN") from error
-    observed = completed.stdout.decode("ascii", errors="replace").strip()
-    if (
-        completed.returncode != 0
-        or observed != source.commit
-        or package_diff.returncode != 0
-        or package_untracked.returncode != 0
-        or package_untracked.stdout
-    ):
+    except SourceMaterializerError as error:
         raise RuntimeAuthenticationError(
-            "PMW_CORE_IDENTITY_MISMATCH", observed[:80]
-        )
+            "PMW_CORE_IDENTITY_UNPROVEN", error.code
+        ) from error
+    except ResearchWorldError as error:
+        raise RuntimeAuthenticationError(error.code, error.detail) from error
 
 
 def authenticate_plan_bundle(
@@ -246,7 +179,7 @@ def authenticate_plan_bundle(
         raise RuntimeAuthenticationError("CORE_LOCK_INVALID", str(error)) from error
     if core_lock.sha256 != plan.core_lock_sha256:
         raise RuntimeAuthenticationError("CORE_LOCK_DRIFT")
-    _validate_loaded_pmw_source(core_lock)
+    _activate_locked_pmw_source(root, core_lock)
 
     try:
         registration = WorldRegistry(root).get(plan.world_id)

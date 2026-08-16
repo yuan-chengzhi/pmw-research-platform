@@ -28,22 +28,44 @@ The following model-free continuation is complete:
 - closure manifest:
   `objects/imports/math-frontier-m03-closure.json`, SHA-256
   `fbf436eec89f7c9c711faaf8a1ee490c5c699ff858d1a32ca46d0316cd9ff749`;
-- current zero-model acceptance bundle:
-  `runs/foundation-acceptance-20260816/{plan.json,briefing.json}`, plan SHA-256
-  `73562a9f2438f4474b12690e18c379b261ef55076fb958eb4c17d8a427103d8b`;
-- briefing: 14 problems, 174 admissions, 530,618 bytes, SHA-256
-  `dc3a2bfaaaa6740a5b0f544e30160079589143b9c6abb42e36d5992ef6b0e7a7`.
+- current zero-model production-candidate cohort:
+  `runs/platform-runtime-acceptance-v2-20260816`, with four explicit sessions
+  at concurrency four;
+- situation-v2 briefing: 14 problems, 174 admissions, 501,644 bytes, SHA-256
+  `401c39cbd5a52ac3834f6b0dfaa37095ea0da9a0ce007bd9db9c9acd5ee52d04`;
+- plan SHA-256:
+  `d736354c87543e1d7016cac4802343459c581fe48437c3a60367c53a9b9ef683`;
+- launch SHA-256:
+  `83f902f0d7cd17a29d9d94fdb1f04496fb79a83f41831bad84873b4789b8090d`;
+- settlement SHA-256:
+  `0408d9ea9891e7929a72a2c7a0b141ff5f4ddef6f5116472a203263f3544f610`;
+- settlement: `SUCCEEDED`, four succeeded, zero failed/cancelled/unknown;
+  every receipt reports zero model calls and zero network calls.
+
+The launch-bound AMF readiness closure covers 14 briefing targets, 15 catalog
+verifiers, registry SHA-256
+`1dac2db72030b8c0be6ae8d233e4665ef32583e72ad7abb3aaa65b734a0b3571`,
+and required-readiness SHA-256
+`94664b72b28554c6bd13fc60d38c745846ab7c53ef5c0bac1761e6651a345db6`.
 
 Earlier scaffold bundles were moved, not deleted, under
 `archive/model-free-scaffolds/`; their names state which pre-contract identity
-or briefing shape they predate.
+or briefing shape they predate. The old foundation bundle is now
+`foundation-acceptance-20260816-pre-core-lock-v2`. A first real runtime
+acceptance attempt exposed a wrong nested invocation-field assumption in the
+example worker; its honest four-failure settlement is retained under
+`archive/model-free-acceptance-failures/platform-runtime-candidate-20260816`.
+The worker was corrected before the successful cohort above. Neither attempt
+called a model or network.
 
 ## M04 freeze
 
 M04 was never launched. Its authorization and billing consent were moved to an
 owner-only revoked directory, and tag `archive/m04-v9-prelaunch` identifies the
 exact prelaunch apparatus. The tag is also on the archived public remote. A
-preflight now fails with `NO_LAUNCH_AUTHORIZATION` before any model call.
+preflight in that archived v9 M04 apparatus fails with
+`NO_LAUNCH_AUTHORIZATION` before any model call. This is historical M04 state,
+not the generic platform's `session preflight` result.
 
 ## Retirement rule
 

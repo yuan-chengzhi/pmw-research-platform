@@ -10,6 +10,8 @@ import sys
 
 import pytest
 
+from pmw_platform.runtime.context import ContextWindowPolicy
+from pmw_platform.runtime.contracts import runtime_host_policy_value
 from pmw_platform.runtime.store import (
     RUNTIME_STATE_SCHEMA,
     RuntimeClaim,
@@ -30,6 +32,10 @@ def _launch(session_ids: list[str]) -> dict[str, object]:
         "mode": "DISABLED",
         "protocol": "NO_PUBLICATION_1",
         "public_config": {},
+    }
+    readiness = {
+        "schema": "PMW_RUNTIME_REQUIRED_READINESS_1",
+        "checks": [],
     }
     return {
         "schema": "PMW_RUNTIME_LAUNCH_1",
@@ -56,19 +62,13 @@ def _launch(session_ids: list[str]) -> dict[str, object]:
             "session_wall_seconds": 86400.0,
             "stop_grace_seconds": 10.0,
         },
-        "host_policy": {
-            "platform_protocol": "PMW_RESEARCH_PLATFORM_RUNTIME_1",
-            "context_limit": "BACKEND_REPORTED_NO_HOST_OVERRIDE",
-            "terminal_authority": "HOST",
-            "unknown_retains_slot": True,
-            "receipt_authority": "DURABLE_STORE",
-            "resource_accounting": {
-                "tree_limits": "AGGREGATE_BYTES_ENTRIES_DEPTH",
-                "scan_schedule": "INITIAL_TERMINAL_AND_PROFILE_LIVE",
-                "hardlinks": "BYTE_DEDUPLICATED_NOT_REJECTED",
-                "single_file_limit": "NOT_ENFORCED",
-            },
-        },
+        "context_window_policy": ContextWindowPolicy().bind(session_ids),
+        "backend_context_window_control": "NOT_APPLICABLE",
+        "required_readiness": readiness,
+        "required_readiness_sha256": hashlib.sha256(
+            canonical_json(readiness)
+        ).hexdigest(),
+        "host_policy": runtime_host_policy_value(),
     }
 
 
@@ -133,6 +133,14 @@ def _receipt(
             },
             "terminal_event": None,
             "warnings": [],
+        },
+        "context_window": {
+            "semantics": (
+                "ACTIVE_MODEL_CONTEXT_WINDOW_TOKENS_NOT_CUMULATIVE_SESSION_USAGE"
+            ),
+            "configured_tokens": None,
+            "backend_control": "NOT_APPLICABLE",
+            "strict_pre_http_input_gate": False,
         },
     }
 

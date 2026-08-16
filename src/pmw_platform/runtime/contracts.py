@@ -18,6 +18,10 @@ from typing import Any, Mapping, Protocol, runtime_checkable
 from ..sessions import SessionSpec
 from ..world import ResearchContribution
 from ..world.records import canonical_json
+from .context import (
+    MAXIMUM_CONTEXT_WINDOW_TOKENS,
+    ContextWindowControl,
+)
 
 
 BACKEND_OUTCOME_SCHEMA = "PMW_RUNTIME_BACKEND_OUTCOME_1"
@@ -44,7 +48,12 @@ def runtime_host_policy_value() -> dict[str, object]:
 
     return {
         "platform_protocol": "PMW_RESEARCH_PLATFORM_RUNTIME_1",
-        "context_limit": "BACKEND_REPORTED_NO_HOST_OVERRIDE",
+        "context_window": {
+            "authority": "IMMUTABLE_LAUNCH_PER_SESSION",
+            "unset": "BACKEND_DECLARED_MODEL_WINDOW",
+            "enforcement": "BACKEND_CAPABILITY_REQUIRED_WHEN_CONFIGURED",
+            "strict_pre_http_input_gate": "NOT_CLAIMED",
+        },
         "terminal_authority": "HOST",
         "unknown_retains_slot": True,
         "receipt_authority": "DURABLE_STORE",
@@ -163,6 +172,7 @@ class SessionRequest:
     evidence: Path
     session_wall_seconds: float | None
     stop_grace_seconds: float
+    context_window_tokens: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.spec, SessionSpec):
@@ -197,6 +207,14 @@ class SessionRequest:
         ):
             raise RuntimeContractError(
                 "MALFORMED_SESSION_REQUEST", "stop_grace_seconds"
+            )
+        if self.context_window_tokens is not None and (
+            type(self.context_window_tokens) is not int
+            or self.context_window_tokens <= 0
+            or self.context_window_tokens > MAXIMUM_CONTEXT_WINDOW_TOKENS
+        ):
+            raise RuntimeContractError(
+                "MALFORMED_SESSION_REQUEST", "context_window_tokens"
             )
 
 
@@ -406,5 +424,13 @@ class RuntimeBackend(Protocol):
 
     @property
     def identity(self) -> BackendIdentity: ...
+
+    @property
+    def context_window_control(self) -> ContextWindowControl: ...
+
+    def verify_runtime(self) -> None:
+        """Synchronously recheck local runtime pins without starting work."""
+
+        ...
 
     async def start(self, request: SessionRequest) -> RunningSession: ...

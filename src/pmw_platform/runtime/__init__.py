@@ -21,6 +21,13 @@ from .contracts import (
     SessionRequest,
     StopProof,
 )
+from .context import (
+    CONTEXT_WINDOW_POLICY_SCHEMA,
+    CONTEXT_WINDOW_SEMANTICS,
+    MAXIMUM_CONTEXT_WINDOW_TOKENS,
+    ContextWindowControl,
+    ContextWindowPolicy,
+)
 from .orchestrator import (
     RuntimeLimits,
     RuntimeOrchestrationError,
@@ -38,6 +45,18 @@ from .pi import (
     load_pi_backend_config,
 )
 from .publish import PublicationIdentity, PmwContributionPublisher
+from .preflight import (
+    PreflightCheck,
+    PreflightChecker,
+    PreflightReport,
+    preflight_prepared_cohort,
+)
+from .readiness import (
+    RequiredReadinessChecker,
+    RequiredReadinessError,
+    RequiredReadinessIdentity,
+    verify_required_readiness,
+)
 from .store import (
     RuntimeClaim,
     RuntimeStore,
@@ -49,6 +68,11 @@ __all__ = [
     "BackendIdentity",
     "BackendOutcome",
     "BackendStartError",
+    "CONTEXT_WINDOW_POLICY_SCHEMA",
+    "CONTEXT_WINDOW_SEMANTICS",
+    "MAXIMUM_CONTEXT_WINDOW_TOKENS",
+    "ContextWindowControl",
+    "ContextWindowPolicy",
     "CommandBackend",
     "CommandBackendConfig",
     "CommandBackendError",
@@ -58,7 +82,13 @@ __all__ = [
     "PiBackendConfig",
     "PiBackendError",
     "PiRpcFailure",
+    "PreflightCheck",
+    "PreflightChecker",
+    "PreflightReport",
     "PreparedCohort",
+    "RequiredReadinessChecker",
+    "RequiredReadinessError",
+    "RequiredReadinessIdentity",
     "RunningSession",
     "RuntimeAuthenticationError",
     "RuntimeBackend",
@@ -77,6 +107,8 @@ __all__ = [
     "load_command_backend",
     "load_pi_backend",
     "load_pi_backend_config",
+    "preflight_prepared_cohort",
+    "verify_required_readiness",
     "run_prepared_cohort",
     "run_runtime_cohort",
 ]

@@ -20,7 +20,7 @@ SNAPSHOT = "snapshot/sha256/" + "f" * 64
 BRIEFING = (
     json.dumps(
         {
-            "schema": "PMW_MATHEMATICAL_SITUATION_1",
+            "schema": "PMW_MATHEMATICAL_SITUATION_2",
             "world_id": "math-frontier",
             "world_ref": "refs/pmw/math-frontier",
             "snapshot_ref": SNAPSHOT,

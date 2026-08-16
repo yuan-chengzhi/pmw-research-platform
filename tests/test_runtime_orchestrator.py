@@ -14,9 +14,15 @@ from pmw_platform.runtime.contracts import (
     BackendOutcome,
     StopProof,
 )
+from pmw_platform.runtime.context import (
+    ContextWindowControl,
+    ContextWindowPolicy,
+)
 from pmw_platform.runtime.orchestrator import (
     RuntimeLimits,
+    RuntimeOrchestrationError,
     run_prepared_cohort,
+    run_runtime_cohort,
 )
 from pmw_platform.runtime import resource_guard as resource_guard_module
 from pmw_platform.runtime.resource_guard import DiskSnapshot
@@ -132,6 +138,9 @@ class _FakeBackend:
         unknown_suffix: str | None = None,
         contribution: ResearchContribution | None = None,
         invalid_stop: bool = False,
+        context_window_control: ContextWindowControl = (
+            ContextWindowControl.NATIVE_MODEL_WINDOW
+        ),
     ) -> None:
         self._identity = BackendIdentity(
             name="fake-runtime",
@@ -147,16 +156,28 @@ class _FakeBackend:
         self.active = 0
         self.peak = 0
         self.started: list[str] = []
+        self.context_windows: dict[str, int | None] = {}
+        self._context_window_control = context_window_control
         self.first_started = asyncio.Event()
 
     @property
     def identity(self) -> BackendIdentity:
         return self._identity
 
+    @property
+    def context_window_control(self) -> ContextWindowControl:
+        return self._context_window_control
+
+    def verify_runtime(self) -> None:
+        return None
+
     async def start(self, request):
         self.active += 1
         self.peak = max(self.peak, self.active)
         self.started.append(request.spec.session_id)
+        self.context_windows[request.spec.session_id] = (
+            request.context_window_tokens
+        )
         self.first_started.set()
         failed = (
             self.failure_suffix is not None
@@ -220,6 +241,167 @@ def test_local_failure_isolated_from_peer_sessions(
     assert result.outcome == "COMPLETED_WITH_FAILURES"
     assert [row["status"] for row in result.receipts].count("FAILED") == 1
     assert [row["status"] for row in result.receipts].count("SUCCEEDED") == 3
+
+
+def test_context_window_default_and_session_override_are_launch_bound(
+    tmp_path: Path,
+) -> None:
+    prepared = _prepared(
+        tmp_path, cohort_id="cohort-context", count=3, concurrency=2
+    )
+    backend = _FakeBackend()
+    overridden = prepared.plan.sessions[1].session_id
+    policy = ContextWindowPolicy(
+        default_tokens=400_000,
+        session_overrides={overridden: 360_000},
+    )
+
+    result = asyncio.run(
+        run_prepared_cohort(prepared, backend, context_policy=policy)
+    )
+
+    assert result.outcome == "SUCCEEDED"
+    assert backend.context_windows == {
+        spec.session_id: 360_000 if spec.session_id == overridden else 400_000
+        for spec in prepared.plan.sessions
+    }
+    launch = RuntimeStore(prepared.cohort_root).read_launch()
+    assert launch["backend_context_window_control"] == "NATIVE_MODEL_WINDOW"
+    assert launch["context_window_policy"] == policy.bind(
+        [spec.session_id for spec in prepared.plan.sessions]
+    )
+    assert [
+        receipt["context_window"]["configured_tokens"]  # type: ignore[index]
+        for receipt in result.receipts
+    ] == [400_000, 360_000, 400_000]
+
+
+def test_required_readiness_is_rechecked_and_bound_into_launch(
+    tmp_path: Path,
+) -> None:
+    prepared = _prepared(
+        tmp_path, cohort_id="cohort-readiness", count=1, concurrency=1
+    )
+    backend = _FakeBackend()
+
+    class Checker:
+        name = "fixture-apparatus"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def verify(self, **values):
+            self.calls += 1
+            assert not (prepared.cohort_root / "runtime").exists()
+            assert values["prepared"] is prepared
+            assert values["backend"] is backend
+            return {"target_count": 14, "portfolio_sha256": "a" * 64}
+
+    checker = Checker()
+    result = asyncio.run(
+        run_prepared_cohort(
+            prepared,
+            backend,
+            required_checkers=(checker,),
+        )
+    )
+
+    assert result.outcome == "SUCCEEDED"
+    assert checker.calls == 1
+    launch = RuntimeStore(prepared.cohort_root).read_launch()
+    assert launch["required_readiness"]["checks"] == [
+        {
+            "name": "fixture-apparatus",
+            "evidence": {
+                "target_count": 14,
+                "portfolio_sha256": "a" * 64,
+            },
+        }
+    ]
+    assert len(launch["required_readiness_sha256"]) == 64
+
+
+def test_public_runtime_entrypoint_forwards_context_and_readiness(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepared = _prepared(
+        tmp_path, cohort_id="cohort-public-entrypoint", count=2, concurrency=1
+    )
+    backend = _FakeBackend()
+    policy = ContextWindowPolicy(default_tokens=400_000)
+    checker = object()
+    observed: dict[str, object] = {}
+    expected = object()
+
+    def fake_authenticate(data_root, cohort_id, **kwargs):
+        observed["authenticate"] = (data_root, cohort_id, kwargs)
+        return prepared
+
+    async def fake_run(selected_prepared, selected_backend, **kwargs):
+        observed["run"] = (selected_prepared, selected_backend, kwargs)
+        return expected
+
+    monkeypatch.setattr(
+        "pmw_platform.runtime.orchestrator.authenticate_plan_bundle",
+        fake_authenticate,
+    )
+    monkeypatch.setattr(
+        "pmw_platform.runtime.orchestrator.run_prepared_cohort",
+        fake_run,
+    )
+
+    result = asyncio.run(
+        run_runtime_cohort(
+            tmp_path,
+            prepared.plan.cohort_id,
+            backend,
+            context_policy=policy,
+            required_checkers=(checker,),  # type: ignore[arg-type]
+        )
+    )
+
+    assert result is expected
+    assert observed["authenticate"] == (
+        tmp_path,
+        prepared.plan.cohort_id,
+        {"profiles_dir": None, "core_lock_path": None},
+    )
+    assert observed["run"] == (
+        prepared,
+        backend,
+        {
+            "limits": None,
+            "context_policy": policy,
+            "publisher": None,
+            "required_checkers": (checker,),
+        },
+    )
+
+
+def test_context_window_rejects_unsupported_backend_before_launch(
+    tmp_path: Path,
+) -> None:
+    prepared = _prepared(
+        tmp_path, cohort_id="cohort-context-unsupported", count=1, concurrency=1
+    )
+    backend = _FakeBackend(
+        context_window_control=ContextWindowControl.NOT_APPLICABLE
+    )
+
+    with pytest.raises(
+        RuntimeOrchestrationError,
+        match="CONTEXT_WINDOW_CONTROL_UNSUPPORTED",
+    ):
+        asyncio.run(
+            run_prepared_cohort(
+                prepared,
+                backend,
+                context_policy=ContextWindowPolicy(default_tokens=400_000),
+            )
+        )
+
+    assert not (prepared.cohort_root / "runtime").exists()
 
 
 def test_backend_identity_drift_after_start_stops_returned_handle(

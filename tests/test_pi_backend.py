@@ -43,6 +43,12 @@ def selected(flag):
 provider = selected("--provider")
 model = selected("--model")
 thinking = selected("--thinking")
+requested_context = (
+    int(selected("--pmw-context-window-tokens"))
+    if "--pmw-context-window-tokens" in sys.argv
+    else 1000000
+)
+reported_context = 1000000 if MODE == "context-mismatch" else requested_context
 command_log = Path.cwd() / "rpc-command-types.jsonl"
 (Path.cwd() / "fake-pi.pid").write_text(str(os.getpid()), encoding="ascii")
 
@@ -71,7 +77,7 @@ for raw in sys.stdin.buffer:
             "model": {{
                 "provider": provider,
                 "id": model,
-                "contextWindow": 1000000,
+                "contextWindow": reported_context,
             }},
             "thinkingLevel": thinking,
             "isStreaming": False,
@@ -92,6 +98,13 @@ for raw in sys.stdin.buffer:
             }}
             encoded = json.dumps(outcome, ensure_ascii=False, allow_nan=False, separators=(",", ":"), sort_keys=True)
             text = "PMW_BACKEND_OUTCOME_JSON_BEGIN\\n" + encoded + "\\nPMW_BACKEND_OUTCOME_JSON_END"
+            if MODE == "extension-error":
+                emit({{
+                    "type": "extension_error",
+                    "extensionPath": "pi-context-window.mjs",
+                    "event": "turn_end",
+                    "error": "PMW_CONTEXT_WINDOW_OVERRIDE_FAILED",
+                }})
             emit({{
                 "type": "message_end",
                 "message": {{
@@ -108,7 +121,7 @@ for raw in sys.stdin.buffer:
         response(kind, request_id, {{
             "sessionId": "fake-pi-session",
             "tokens": {{"input": 123, "output": 45, "total": 168}},
-            "contextUsage": {{"tokens": 123, "contextWindow": 1000000, "percent": 1}},
+            "contextUsage": {{"tokens": 123, "contextWindow": reported_context, "percent": 1}},
         }})
     elif kind == "abort":
         response(kind, request_id)
@@ -175,7 +188,9 @@ def _runtime_fixture(tmp_path: Path, *, mode: str = "success") -> tuple[Path, Pa
     return config_path, agent_dir
 
 
-def _request(tmp_path: Path) -> SessionRequest:
+def _request(
+    tmp_path: Path, *, context_window_tokens: int | None = None
+) -> SessionRequest:
     root = tmp_path / "session-layout"
     input_root = root / "input"
     private = root / "private"
@@ -216,6 +231,7 @@ def _request(tmp_path: Path) -> SessionRequest:
         evidence=evidence.resolve(),
         session_wall_seconds=10.0,
         stop_grace_seconds=1.0,
+        context_window_tokens=context_window_tokens,
     )
 
 
@@ -258,6 +274,16 @@ def test_config_is_strict_json_and_public_identity_redacts_oauth(tmp_path: Path)
     assert backend.identity.public_config["pi_installation_tree_protocol"] == (
         "PMW_PI_INSTALLATION_TREE_2"
     )
+    assert backend.identity.public_config["context_window_control"] == (
+        "NATIVE_MODEL_WINDOW"
+    )
+    assert backend.identity.public_config["context_window_extension"] == {
+        "filename": "pi-context-window.mjs",
+        "sha256": config.context_window_extension.sha256,
+        "flag": "pmw-context-window-tokens",
+    }
+    assert backend.identity.public_config["requested_builtin_names"] == []
+    assert backend.identity.public_config["requested_extension_tool_names"] == []
     assert backend.identity.public_config["runtime_pin_limits"] == {
         "maximum_node_executable_bytes": 512 * 1024 * 1024,
         "maximum_pi_entrypoint_bytes": 128 * 1024 * 1024,
@@ -273,6 +299,97 @@ def test_config_is_strict_json_and_public_identity_redacts_oauth(tmp_path: Path)
     config_path.write_bytes(config_path.read_bytes() + b"\n")
     reparsed = load_pi_backend_config(config_path)
     assert reparsed.to_public_value() == config.to_public_value()
+
+
+def test_context_extension_preserves_model_routing_headers() -> None:
+    extension = (
+        Path(pi_runtime.__file__).resolve().with_name("pi-context-window.mjs")
+    ).read_text(encoding="utf-8")
+
+    assert 'pi.on("session_start"' in extension
+    assert 'pi.on("before_agent_start"' not in extension
+    assert 'pi.on("context"' not in extension
+    assert 'pi.on("turn_end"' not in extension
+    assert "model.contextWindow = tokens" in extension
+    assert "pi.setModel" not in extension
+    assert "pi.registerProvider" not in extension
+
+
+def test_builtin_tools_are_an_explicit_allowlist_without_extensions(
+    tmp_path: Path,
+) -> None:
+    config_path, _agent_dir = _runtime_fixture(tmp_path)
+    value = json.loads(config_path.read_text(encoding="utf-8"))
+    value["tools"] = ["bash", "read", "write"]
+    config_path.write_bytes(canonical_json(value))
+    config = load_pi_backend_config(config_path)
+
+    argv = pi_runtime._build_argv(
+        config,
+        _request(tmp_path),
+        tmp_path / "pi-session",
+    )
+
+    assert "--no-builtin-tools" not in argv
+    tools_index = argv.index("--tools")
+    assert argv[tools_index + 1] == "bash,read,write"
+    assert config.to_public_value()["requested_builtin_names"] == [
+        "bash",
+        "read",
+        "write",
+    ]
+    assert config.to_public_value()["requested_extension_tool_names"] == []
+
+
+def test_empty_tool_allowlist_is_enforced_with_no_tools(tmp_path: Path) -> None:
+    config_path, _agent_dir = _runtime_fixture(tmp_path)
+    config = load_pi_backend_config(config_path)
+
+    argv = pi_runtime._build_argv(
+        config,
+        _request(tmp_path),
+        tmp_path / "pi-session",
+    )
+
+    assert "--no-tools" in argv
+    assert "--no-builtin-tools" in argv
+    assert "--tools" not in argv
+    assert config.to_public_value()["tools"] == []
+
+
+def test_custom_tools_still_require_a_pinned_extension(tmp_path: Path) -> None:
+    config_path, _agent_dir = _runtime_fixture(tmp_path)
+    value = json.loads(config_path.read_text(encoding="utf-8"))
+    value["tools"] = ["verifier_submit"]
+    config_path.write_bytes(canonical_json(value))
+
+    with pytest.raises(PiBackendError) as raised:
+        load_pi_backend_config(config_path)
+
+    assert raised.value.code == "MALFORMED_PI_CONFIG"
+    assert raised.value.detail == "custom tools require explicit extensions"
+
+
+def test_configured_context_rejects_external_extensions_before_start(
+    tmp_path: Path,
+) -> None:
+    config_path, _agent_dir = _runtime_fixture(tmp_path)
+    extension = _write(
+        tmp_path / "external-extension.mjs",
+        b"export default () => {};\n",
+    )
+    value = json.loads(config_path.read_text(encoding="utf-8"))
+    value["extensions"] = [str(extension.resolve())]
+    config_path.write_bytes(canonical_json(value))
+    backend = PiBackend(load_pi_backend_config(config_path))
+
+    with pytest.raises(PiBackendError) as raised:
+        backend.validate_context_window_policy(
+            pi_runtime.ContextWindowPolicy(default_tokens=400_000),
+            ("session-a",),
+        )
+
+    assert raised.value.code == "PI_CONTEXT_EXTENSION_COMPATIBILITY_UNPROVEN"
 
 
 def test_pi_identity_covers_the_complete_installation_tree(tmp_path: Path) -> None:
@@ -448,7 +565,6 @@ def test_fake_rpc_success_records_official_context_without_host_cap(
     runtime = outcome.evidence["pi_rpc"]
     assert runtime["pi_reported_context_window"] == 1_000_000
     assert runtime["account_route_context_acceptance"] == "NOT_MEASURED_BY_ADAPTER"
-    assert runtime["host_context_limit"] is None
     assert runtime["host_prompt_count"] == 1
     assert runtime["host_retry_count"] == 0
     assert runtime["host_compaction_count"] == 0
@@ -465,6 +581,67 @@ def test_fake_rpc_success_records_official_context_without_host_cap(
     frames_path = request.evidence / "pi.frames.jsonl"
     assert frames_path.stat().st_size <= 1_048_576
     assert b"do-not-persist-this-token" not in frames_path.read_bytes()
+
+
+def test_fake_rpc_applies_configured_context_before_first_prompt(
+    tmp_path: Path,
+) -> None:
+    config_path, _agent_dir = _runtime_fixture(tmp_path)
+    backend = PiBackend(load_pi_backend_config(config_path))
+    request = _request(tmp_path, context_window_tokens=400_000)
+
+    async def run():
+        handle = await backend.start(request)
+        return await handle.wait()
+
+    outcome = asyncio.run(run())
+
+    assert outcome.success is True
+    runtime = outcome.evidence["pi_rpc"]
+    assert runtime["configured_context_window_tokens"] == 400_000
+    assert runtime["pi_reported_context_window"] == 400_000
+    assert runtime["context_window_control"] == "NATIVE_MODEL_WINDOW"
+    assert runtime["strict_pre_http_input_gate"] is False
+    assert outcome.usage["pi_rpc"]["configured_context_window_tokens"] == 400_000
+    assert outcome.usage["pi_rpc"]["pi_reported_context_window"] == 400_000
+    assert _command_types(request)[:2] == ["get_state", "prompt"]
+
+
+def test_context_override_mismatch_fails_before_prompt(
+    tmp_path: Path,
+) -> None:
+    config_path, _agent_dir = _runtime_fixture(
+        tmp_path, mode="context-mismatch"
+    )
+    backend = PiBackend(load_pi_backend_config(config_path))
+    request = _request(tmp_path, context_window_tokens=400_000)
+
+    async def run():
+        handle = await backend.start(request)
+        return await handle.wait()
+
+    outcome = asyncio.run(run())
+
+    assert outcome.success is False
+    assert outcome.terminal_reason == "RUNTIME_PROFILE_MISMATCH"
+    assert _command_types(request)[0] == "get_state"
+    assert "prompt" not in _command_types(request)
+
+
+def test_extension_error_is_terminal_apparatus_failure(tmp_path: Path) -> None:
+    config_path, _agent_dir = _runtime_fixture(tmp_path, mode="extension-error")
+    backend = PiBackend(load_pi_backend_config(config_path))
+    request = _request(tmp_path, context_window_tokens=400_000)
+
+    async def run():
+        handle = await backend.start(request)
+        return await handle.wait()
+
+    outcome = asyncio.run(run())
+
+    assert outcome.success is False
+    assert outcome.terminal_reason == "PI_EXTENSION_ERROR"
+    assert outcome.evidence["pi_rpc"]["stop_proof"]["stopped"] is True
 
 
 @pytest.mark.parametrize(

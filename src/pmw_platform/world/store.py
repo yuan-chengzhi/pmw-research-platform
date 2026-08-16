@@ -5,12 +5,14 @@ from __future__ import annotations
 import base64
 from collections import OrderedDict
 from dataclasses import dataclass, field
+import importlib
 import json
 import math
 import os
 from pathlib import Path
 import re
 import stat
+import sys
 import threading
 from typing import Any, Callable, NoReturn, TYPE_CHECKING
 
@@ -20,31 +22,21 @@ if TYPE_CHECKING:
     from ..sessions.model import SessionSpec
 
 
-try:  # The deployment source cache supplies the commit pinned by core-lock.json.
-    from pmw_r2.pi_agent_tools import (
-        AgentToolBinding,
-        PMW_PROPOSE,
-        PiAgentToolDispatcher,
-        new_channel_token,
-        sign_tool_envelope,
-    )
-    from pmw_r2.platform_admission import (
-        AdmissionError,
-        GitWorldBroker,
-        audit_git_world,
-    )
-except ImportError as exc:  # Records remain usable without the optional core.
-    AgentToolBinding = None  # type: ignore[assignment]
-    PiAgentToolDispatcher = None  # type: ignore[assignment]
-    GitWorldBroker = None  # type: ignore[assignment]
-    AdmissionError = Exception  # type: ignore[assignment,misc]
-    PMW_PROPOSE = "pmw_propose"
-    new_channel_token = None  # type: ignore[assignment]
-    sign_tool_envelope = None  # type: ignore[assignment]
-    audit_git_world = None  # type: ignore[assignment]
-    _CORE_IMPORT_ERROR: ImportError | None = exc
-else:
-    _CORE_IMPORT_ERROR = None
+# Runtime authentication activates the package from the complete core-lock
+# materialization after that tree has been audited.  Keeping this import lazy
+# lets a normal wheel install and the managed source cache work without a
+# deployment-only editable Git checkout.
+AgentToolBinding = None  # type: ignore[assignment]
+PiAgentToolDispatcher = None  # type: ignore[assignment]
+GitWorldBroker = None  # type: ignore[assignment]
+AdmissionError = Exception  # type: ignore[assignment,misc]
+PMW_PROPOSE = "pmw_propose"
+new_channel_token = None  # type: ignore[assignment]
+sign_tool_envelope = None  # type: ignore[assignment]
+audit_git_world = None  # type: ignore[assignment]
+_CORE_IMPORT_ERROR: ImportError | None = ImportError("pmw_r2 is not activated")
+_ACTIVE_CORE_TREE_SHA256: str | None = None
+_ACTIVE_CORE_SOURCE_ROOT: Path | None = None
 
 
 DEFAULT_WORLD_REF = "refs/pmw/research-world"
@@ -72,12 +64,127 @@ def _fail(code: str, detail: str = "") -> NoReturn:
     raise ResearchWorldError(code, detail)
 
 
+def _assign_core_modules(agent_tools: object, platform_admission: object) -> None:
+    global AgentToolBinding
+    global PiAgentToolDispatcher
+    global GitWorldBroker
+    global AdmissionError
+    global PMW_PROPOSE
+    global new_channel_token
+    global sign_tool_envelope
+    global audit_git_world
+    global _CORE_IMPORT_ERROR
+
+    AgentToolBinding = getattr(agent_tools, "AgentToolBinding")
+    PiAgentToolDispatcher = getattr(agent_tools, "PiAgentToolDispatcher")
+    PMW_PROPOSE = getattr(agent_tools, "PMW_PROPOSE")
+    new_channel_token = getattr(agent_tools, "new_channel_token")
+    sign_tool_envelope = getattr(agent_tools, "sign_tool_envelope")
+    AdmissionError = getattr(platform_admission, "AdmissionError")
+    GitWorldBroker = getattr(platform_admission, "GitWorldBroker")
+    audit_git_world = getattr(platform_admission, "audit_git_world")
+    _CORE_IMPORT_ERROR = None
+
+
+def _import_core_modules() -> tuple[object, object]:
+    return (
+        importlib.import_module("pmw_r2.pi_agent_tools"),
+        importlib.import_module("pmw_r2.platform_admission"),
+    )
+
+
+def activate_pmw_core(
+    materialized_tree: Path,
+    *,
+    tree_sha256: str,
+) -> None:
+    """Load PMW only from one already audited core-lock materialization.
+
+    The caller owns the source-tree audit.  This function closes the remaining
+    execution boundary by requiring both imported modules to originate below
+    that exact tree's ``src`` directory.  A process cannot switch to a
+    different PMW tree after activation.
+    """
+
+    global _ACTIVE_CORE_SOURCE_ROOT
+    global _ACTIVE_CORE_TREE_SHA256
+
+    if not isinstance(materialized_tree, Path):
+        raise TypeError("materialized_tree must be a Path")
+    if type(tree_sha256) is not str or _FINGERPRINT.fullmatch(tree_sha256) is None:
+        _fail("PMW_CORE_IDENTITY_UNPROVEN", "tree digest")
+    try:
+        tree = materialized_tree.resolve(strict=True)
+        python_root = (tree / "src").resolve(strict=True)
+        package_root = (python_root / "pmw_r2").resolve(strict=True)
+    except OSError as error:
+        raise ResearchWorldError("PMW_CORE_UNAVAILABLE") from error
+    if (
+        tree != materialized_tree
+        or tree.is_symlink()
+        or python_root.parent != tree
+        or package_root.parent != python_root
+        or not python_root.is_dir()
+        or not package_root.is_dir()
+    ):
+        _fail("PMW_CORE_IDENTITY_UNPROVEN", "materialized package path")
+    if _ACTIVE_CORE_TREE_SHA256 is not None:
+        if _ACTIVE_CORE_TREE_SHA256 != tree_sha256:
+            _fail("PMW_CORE_IDENTITY_MISMATCH", "process already activated")
+        return
+
+    inserted = False
+    before_modules = set(sys.modules)
+    python_root_text = str(python_root)
+    if python_root_text not in sys.path:
+        sys.path.insert(0, python_root_text)
+        inserted = True
+    try:
+        importlib.invalidate_caches()
+        agent_tools, platform_admission = _import_core_modules()
+        for module in (agent_tools, platform_admission):
+            origin = getattr(module, "__file__", None)
+            if type(origin) is not str:
+                _fail("PMW_CORE_IDENTITY_UNPROVEN", "module origin")
+            selected = Path(origin).resolve(strict=True)
+            if selected != package_root and package_root not in selected.parents:
+                _fail("PMW_CORE_IDENTITY_MISMATCH", str(selected)[:512])
+        _assign_core_modules(agent_tools, platform_admission)
+    except ResearchWorldError:
+        for name in set(sys.modules).difference(before_modules):
+            if name == "pmw_r2" or name.startswith("pmw_r2."):
+                sys.modules.pop(name, None)
+        if inserted:
+            try:
+                sys.path.remove(python_root_text)
+            except ValueError:
+                pass
+        raise
+    except (ImportError, AttributeError, OSError) as error:
+        for name in set(sys.modules).difference(before_modules):
+            if name == "pmw_r2" or name.startswith("pmw_r2."):
+                sys.modules.pop(name, None)
+        if inserted:
+            try:
+                sys.path.remove(python_root_text)
+            except ValueError:
+                pass
+        raise ResearchWorldError("PMW_CORE_UNAVAILABLE") from error
+    _ACTIVE_CORE_SOURCE_ROOT = tree
+    _ACTIVE_CORE_TREE_SHA256 = tree_sha256
+
+
 def _require_core() -> None:
-    if _CORE_IMPORT_ERROR is not None:
+    if _CORE_IMPORT_ERROR is None:
+        return
+    try:
+        agent_tools, platform_admission = _import_core_modules()
+        _assign_core_modules(agent_tools, platform_admission)
+    except (ImportError, AttributeError) as error:
         raise ResearchWorldError(
             "PMW_CORE_UNAVAILABLE",
-            "install or expose the commit pinned by pmw_platform/locks/core-lock.json",
-        ) from _CORE_IMPORT_ERROR
+            "materialize/activate the commit pinned by core-lock.json",
+        ) from error
 
 
 def _reference(value: object, *, label: str) -> str:

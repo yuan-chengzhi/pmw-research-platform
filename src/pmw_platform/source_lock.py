@@ -11,8 +11,9 @@ from types import MappingProxyType
 from typing import Mapping
 
 
-CORE_LOCK_SCHEMA = "PMW_RESEARCH_CORE_LOCK_1"
+CORE_LOCK_SCHEMA = "PMW_RESEARCH_CORE_LOCK_2"
 _COMMIT = re.compile(r"[0-9a-f]{40}")
+_DIGEST = re.compile(r"[0-9a-f]{64}")
 
 
 class SourceLockError(ValueError):
@@ -25,6 +26,7 @@ class LockedSource:
     repository: str
     commit: str
     role: str
+    materialized_tree_sha256: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,12 +96,18 @@ def load_core_lock(path: str | Path | None = None) -> CoreLock:
         if type(name) is not str or type(raw_source) is not dict:
             raise SourceLockError("invalid source entry")
         if set(raw_source) not in (
-            {"repository", "commit", "python_package"},
-            {"repository", "commit", "role"},
+            {
+                "repository",
+                "commit",
+                "materialized_tree_sha256",
+                "python_package",
+            },
+            {"repository", "commit", "materialized_tree_sha256", "role"},
         ):
             raise SourceLockError(f"invalid fields for locked source: {name}")
         repository = raw_source.get("repository")
         commit = raw_source.get("commit")
+        materialized_tree_sha256 = raw_source.get("materialized_tree_sha256")
         role = raw_source.get("python_package", raw_source.get("role"))
         if (
             type(repository) is not str
@@ -107,11 +115,19 @@ def load_core_lock(path: str | Path | None = None) -> CoreLock:
             or not repository.endswith(".git")
             or type(commit) is not str
             or _COMMIT.fullmatch(commit) is None
+            or type(materialized_tree_sha256) is not str
+            or _DIGEST.fullmatch(materialized_tree_sha256) is None
             or type(role) is not str
             or not role
         ):
             raise SourceLockError(f"invalid identity for locked source: {name}")
-        sources[name] = LockedSource(name, repository, commit, role)
+        sources[name] = LockedSource(
+            name,
+            repository,
+            commit,
+            role,
+            materialized_tree_sha256,
+        )
     if set(sources) != {"agent-math-frontier", "persistent-mathematical-worlds"}:
         raise SourceLockError("core lock must bind the problem and PMW authorities")
     canonical = json.dumps(

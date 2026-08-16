@@ -13,7 +13,7 @@ from .records import RESEARCH_RECORD_SCHEMA, canonical_json
 from .store import ResearchWorld, ResearchWorldError, WorldAdmission
 
 
-SITUATION_SCHEMA = "PMW_MATHEMATICAL_SITUATION_1"
+SITUATION_SCHEMA = "PMW_MATHEMATICAL_SITUATION_2"
 MAXIMUM_SITUATION_BYTES = 16 * 1024 * 1024
 MAXIMUM_PROJECTED_STRING_BYTES = 12_000
 MAXIMUM_PROJECTED_ITEMS = 128
@@ -221,10 +221,12 @@ def build_mathematical_situation(
 ) -> MathematicalSituation:
     """Build the exact problem set plus a loss-aware index of current state.
 
-    Target cards are included in full.  Every other admission is represented
-    once by a bounded mathematical projection, content digest, and exact
-    retrieval reference.  This avoids silently dropping history while keeping
-    the initial briefing suitable for a model context.
+    Target cards contribute their mathematical content, but predecessor
+    campaign runtime budgets are omitted and content-bound as explicitly
+    non-operative provenance.  Every other admission is represented once by a
+    bounded mathematical projection, content digest, and exact retrieval
+    reference.  This avoids silently dropping history while keeping the
+    initial briefing suitable for a model context.
     """
 
     if (
@@ -241,11 +243,27 @@ def build_mathematical_situation(
     scoped_refs: set[str] = set()
     for problem in legacy.problems:
         scoped_refs.update(problem.research_admission_refs)
+        card = problem.card
+        historical_runtime = card.pop("budget_contract", None)
+        omitted_runtime = None
+        if historical_runtime is not None:
+            historical_raw = canonical_json(historical_runtime)
+            omitted_runtime = {
+                "field": "budget_contract",
+                "sha256": hashlib.sha256(historical_raw).hexdigest(),
+                "bytes": len(historical_raw),
+                "semantics": "NON_OPERATIVE_PREDECESSOR_CAMPAIGN_PROVENANCE",
+                "exact_content": {
+                    "method": "world.get",
+                    "admission_ref": problem.target_card_admission_ref,
+                },
+            }
         problem_entries.append({
             "problem_id": problem.problem_id,
             "target_card_admission_ref": problem.target_card_admission_ref,
             "target_card_ref": problem.target_card_ref,
-            "problem": problem.card,
+            "problem": card,
+            "omitted_historical_runtime_contract": omitted_runtime,
             "research_admission_refs": list(problem.research_admission_refs),
         })
     target_card_refs = {
@@ -267,7 +285,12 @@ def build_mathematical_situation(
         "unscoped_admission_refs": unscoped_refs,
         "schema_counts": legacy.schema_counts,
         "semantics": {
-            "problem_cards": "EXACT_CONTENT_AT_SNAPSHOT",
+            "problem_cards": (
+                "MATHEMATICAL_CONTENT_WITH_PREDECESSOR_RUNTIME_BUDGET_OMITTED"
+            ),
+            "runtime_authority": (
+                "HOST_INVOCATION_AND_LAUNCH_ONLY_NOT_HISTORICAL_WORLD_RECORDS"
+            ),
             "records": "ONE_BOUNDED_LOSS_AWARE_PROJECTION_PER_NON_CARD_ADMISSION",
             "problem_links": "RESEARCH_ADMISSION_REFS_JOIN_TO_RECORDS",
             "truth_ranking": "NONE",

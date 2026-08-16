@@ -16,7 +16,7 @@ import inspect
 import json
 import math
 from pathlib import Path
-from typing import Awaitable, Protocol
+from typing import Awaitable, Protocol, Sequence
 
 from ..sessions import SessionSpec, SessionStatus
 from ..world import ResearchContribution
@@ -33,7 +33,17 @@ from .contracts import (
     StopProof,
     runtime_host_policy_value,
 )
+from .context import (
+    CONTEXT_WINDOW_SEMANTICS,
+    ContextWindowControl,
+    ContextWindowPolicy,
+)
 from .publish import PublicationIdentity
+from .readiness import (
+    RequiredReadinessChecker,
+    RequiredReadinessIdentity,
+    verify_required_readiness,
+)
 from .resource_guard import ResourceEvent, ResourceGuard
 from .store import RuntimeClaim, RuntimeStore, RuntimeStoreError
 
@@ -193,6 +203,11 @@ def build_launch_manifest(
     identity: BackendIdentity,
     limits: RuntimeLimits,
     publication_identity: PublicationIdentity | None = None,
+    context_policy: ContextWindowPolicy | None = None,
+    context_window_control: ContextWindowControl = (
+        ContextWindowControl.NOT_APPLICABLE
+    ),
+    required_readiness: RequiredReadinessIdentity | None = None,
 ) -> dict[str, object]:
     """Build the immutable execution identity, separate from the math plan."""
 
@@ -207,6 +222,21 @@ def build_launch_manifest(
     )
     if not isinstance(selected_publication, PublicationIdentity):
         raise TypeError("publication identity must be PublicationIdentity")
+    selected_context = (
+        ContextWindowPolicy() if context_policy is None else context_policy
+    )
+    if not isinstance(selected_context, ContextWindowPolicy):
+        raise TypeError("context_policy must be ContextWindowPolicy")
+    if not isinstance(context_window_control, ContextWindowControl):
+        raise TypeError("context_window_control must be ContextWindowControl")
+    selected_readiness = (
+        RequiredReadinessIdentity(())
+        if required_readiness is None
+        else required_readiness
+    )
+    if not isinstance(selected_readiness, RequiredReadinessIdentity):
+        raise TypeError("required_readiness must be RequiredReadinessIdentity")
+    session_ids = [item.session_id for item in prepared.plan.sessions]
     return {
         "schema": RUNTIME_LAUNCH_SCHEMA,
         "created_at": _now(),
@@ -224,8 +254,12 @@ def build_launch_manifest(
         "publication": selected_publication.to_value(),
         "publication_sha256": selected_publication.sha256,
         "concurrency": prepared.plan.concurrency,
-        "session_ids": [item.session_id for item in prepared.plan.sessions],
+        "session_ids": session_ids,
         "limits": limits.to_value(),
+        "context_window_policy": selected_context.bind(session_ids),
+        "backend_context_window_control": context_window_control.value,
+        "required_readiness": selected_readiness.to_value(),
+        "required_readiness_sha256": selected_readiness.sha256,
         "host_policy": runtime_host_policy_value(),
     }
 
@@ -240,8 +274,11 @@ class _Controller:
         store: RuntimeStore,
         launch_sha256: str,
         limits: RuntimeLimits,
+        context_policy: ContextWindowPolicy,
+        context_window_control: ContextWindowControl,
         publisher: ContributionPublisher | None,
         publication_identity: PublicationIdentity,
+        required_readiness: RequiredReadinessIdentity,
         resource_guard: ResourceGuard,
     ) -> None:
         self.prepared = prepared
@@ -250,8 +287,11 @@ class _Controller:
         self.store = store
         self.launch_sha256 = launch_sha256
         self.limits = limits
+        self.context_policy = context_policy
+        self.context_window_control = context_window_control
         self.publisher = publisher
         self.publication_identity = publication_identity
+        self.required_readiness = required_readiness
         self.resource_guard = resource_guard
         self.stop_new = asyncio.Event()
         self.external_cancel = False
@@ -339,6 +379,15 @@ class _Controller:
                 ),
                 "stop_grace_seconds": float(self.limits.stop_grace_seconds),
             },
+            "context_window": {
+                "semantics": CONTEXT_WINDOW_SEMANTICS,
+                "context_window_tokens": self.context_policy.for_session(
+                    spec.session_id
+                ),
+                "backend_control": self.context_window_control.value,
+                "strict_pre_http_input_gate": False,
+            },
+            "required_readiness": self.required_readiness.to_value(),
         }
 
     def _request(self, spec: SessionSpec) -> SessionRequest:
@@ -369,6 +418,9 @@ class _Controller:
                 else float(self.limits.session_wall_seconds)
             ),
             stop_grace_seconds=float(self.limits.stop_grace_seconds),
+            context_window_tokens=self.context_policy.for_session(
+                spec.session_id
+            ),
         )
 
     async def _persist(
@@ -427,6 +479,14 @@ class _Controller:
                 }
             ),
             "resource_guard": self.resource_guard.evidence(spec.session_id),
+            "context_window": {
+                "semantics": CONTEXT_WINDOW_SEMANTICS,
+                "configured_tokens": self.context_policy.for_session(
+                    spec.session_id
+                ),
+                "backend_control": self.context_window_control.value,
+                "strict_pre_http_input_gate": False,
+            },
         }
         try:
             digest = self.store.write_receipt(spec.session_id, receipt)
@@ -998,18 +1058,62 @@ async def run_prepared_cohort(
     backend: RuntimeBackend,
     *,
     limits: RuntimeLimits | None = None,
+    context_policy: ContextWindowPolicy | None = None,
     publisher: ContributionPublisher | None = None,
+    required_checkers: Sequence[RequiredReadinessChecker] = (),
 ) -> RuntimeRunResult:
     """Run exactly the sessions frozen in one authenticated plan bundle."""
 
     selected_limits = RuntimeLimits() if limits is None else limits
+    selected_context = (
+        ContextWindowPolicy() if context_policy is None else context_policy
+    )
     if not isinstance(prepared, PreparedCohort):
         raise TypeError("prepared must be PreparedCohort")
     if not isinstance(selected_limits, RuntimeLimits):
         raise TypeError("limits must be RuntimeLimits")
+    if not isinstance(selected_context, ContextWindowPolicy):
+        raise TypeError("context_policy must be ContextWindowPolicy")
+    if isinstance(required_checkers, (str, bytes)) or not isinstance(
+        required_checkers, Sequence
+    ):
+        raise TypeError("required_checkers must be a sequence")
     identity = backend.identity
     if not isinstance(identity, BackendIdentity):
         raise TypeError("backend.identity must be BackendIdentity")
+    context_window_control = getattr(
+        backend,
+        "context_window_control",
+        ContextWindowControl.NOT_APPLICABLE,
+    )
+    if not isinstance(context_window_control, ContextWindowControl):
+        raise TypeError(
+            "backend.context_window_control must be ContextWindowControl"
+        )
+    # Bind before creating RuntimeClaim/runtime files so a stale session ID or
+    # unsupported treatment remains a genuinely read-only launch rejection.
+    selected_context.bind(
+        [spec.session_id for spec in prepared.plan.sessions]
+    )
+    if (
+        selected_context.configured
+        and context_window_control
+        is not ContextWindowControl.NATIVE_MODEL_WINDOW
+    ):
+        raise RuntimeOrchestrationError("CONTEXT_WINDOW_CONTROL_UNSUPPORTED")
+    context_validator = getattr(backend, "validate_context_window_policy", None)
+    if context_validator is not None:
+        result = context_validator(
+            selected_context,
+            tuple(spec.session_id for spec in prepared.plan.sessions),
+        )
+        if inspect.isawaitable(result) or result is not None:
+            close = getattr(result, "close", None)
+            if callable(close):
+                close()
+            raise TypeError(
+                "backend.validate_context_window_policy must be synchronous and return None"
+            )
     publication_identity = PublicationIdentity.disabled()
     if publisher is not None:
         publication_identity = getattr(publisher, "identity", None)
@@ -1020,11 +1124,27 @@ async def run_prepared_cohort(
 
     with RuntimeClaim(prepared.cohort_root):
         store = RuntimeStore(prepared.cohort_root)
+        # Advisory preflight is outside the claim.  These mutable pin and
+        # apparatus checks are repeated here, before any runtime path exists,
+        # and their public evidence becomes immutable launch identity.
+        await asyncio.to_thread(backend.verify_runtime)
+        required_readiness = await asyncio.to_thread(
+            verify_required_readiness,
+            required_checkers,
+            prepared=prepared,
+            backend=backend,
+            limits=selected_limits,
+            context_policy=selected_context,
+            publication_identity=publication_identity,
+        )
         launch = build_launch_manifest(
             prepared,
             identity,
             selected_limits,
             publication_identity,
+            selected_context,
+            context_window_control,
+            required_readiness,
         )
         launch_sha256 = store.create_launch(
             launch,
@@ -1046,8 +1166,11 @@ async def run_prepared_cohort(
             store=store,
             launch_sha256=launch_sha256,
             limits=selected_limits,
+            context_policy=selected_context,
+            context_window_control=context_window_control,
             publisher=publisher,
             publication_identity=publication_identity,
+            required_readiness=required_readiness,
             resource_guard=resource_guard,
         )
         controller._observe_resource_event(initial_resource_event)
@@ -1125,7 +1248,9 @@ async def run_runtime_cohort(
     backend: RuntimeBackend,
     *,
     limits: RuntimeLimits | None = None,
+    context_policy: ContextWindowPolicy | None = None,
     publisher: ContributionPublisher | None = None,
+    required_checkers: Sequence[RequiredReadinessChecker] = (),
     profiles_dir: str | Path | None = None,
     core_lock_path: str | Path | None = None,
 ) -> RuntimeRunResult:
@@ -1141,5 +1266,7 @@ async def run_runtime_cohort(
         prepared,
         backend,
         limits=limits,
+        context_policy=context_policy,
         publisher=publisher,
+        required_checkers=required_checkers,
     )

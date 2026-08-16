@@ -171,11 +171,15 @@ def test_session_start_routes_authenticated_plan_backend_and_limits(
         selected_backend: object,
         *,
         limits: object,
+        context_policy: object,
         publisher: object,
+        required_checkers: object,
     ) -> object:
         observed["run"] = (selected_prepared, selected_backend)
         observed["limits"] = limits
+        observed["context_policy"] = context_policy
         observed["publisher"] = publisher
+        observed["required_checkers"] = required_checkers
         return SimpleNamespace(
             launch_sha256="a" * 64,
             settlement_sha256="b" * 64,
@@ -186,6 +190,11 @@ def test_session_start_routes_authenticated_plan_backend_and_limits(
     monkeypatch.setattr(cli, "authenticate_plan_bundle", fake_authenticate)
     monkeypatch.setattr(cli, "load_command_backend", fake_load_backend)
     monkeypatch.setattr(cli, "run_prepared_cohort", fake_run)
+    monkeypatch.setattr(
+        cli,
+        "_runtime_preflight_report",
+        lambda *_args: SimpleNamespace(ready=True),
+    )
     monkeypatch.setattr(
         cli,
         "_emit",
@@ -220,6 +229,7 @@ def test_session_start_routes_authenticated_plan_backend_and_limits(
     assert limits.startup_seconds == 12.5
     assert limits.session_wall_seconds is None
     assert limits.stop_grace_seconds == 3.0
+    assert observed["context_policy"].configured is False
     assert observed["publisher"] is None
     assert emitted == [
         (
@@ -268,10 +278,14 @@ def test_session_start_routes_writer_authority_only_to_host_publisher(
         selected_backend: object,
         *,
         limits: object,
+        context_policy: object,
         publisher: object,
+        required_checkers: object,
     ) -> object:
         observed["backend"] = selected_backend
         observed["publisher"] = publisher
+        observed["context_policy"] = context_policy
+        observed["required_checkers"] = required_checkers
         return SimpleNamespace(
             launch_sha256="c" * 64,
             settlement_sha256="d" * 64,
@@ -282,6 +296,11 @@ def test_session_start_routes_writer_authority_only_to_host_publisher(
     monkeypatch.setattr(cli, "load_writer_authority", fake_load_authority)
     monkeypatch.setattr(cli.PmwContributionPublisher, "create", fake_publisher_create)
     monkeypatch.setattr(cli, "run_prepared_cohort", fake_run)
+    monkeypatch.setattr(
+        cli,
+        "_runtime_preflight_report",
+        lambda *_args: SimpleNamespace(ready=True),
+    )
     monkeypatch.setattr(
         cli,
         "_emit",
@@ -310,6 +329,7 @@ def test_session_start_routes_writer_authority_only_to_host_publisher(
     assert observed["publisher_create"] == (prepared, authority)
     assert observed["publisher"] is publisher
     assert observed["backend"] is backend
+    assert observed["context_policy"].configured is False
     assert len(emitted) == 1
 
 
@@ -335,6 +355,11 @@ def test_session_start_interrupt_reports_status_and_returns_130(
     monkeypatch.setattr(cli, "authenticate_plan_bundle", lambda *_args: prepared)
     monkeypatch.setattr(cli, "load_command_backend", lambda _path: object())
     monkeypatch.setattr(cli, "run_prepared_cohort", interrupted)
+    monkeypatch.setattr(
+        cli,
+        "_runtime_preflight_report",
+        lambda *_args: SimpleNamespace(ready=True),
+    )
     monkeypatch.setattr(cli, "RuntimeStore", FakeStore)
     monkeypatch.setattr(
         cli,
@@ -368,6 +393,76 @@ def test_session_start_interrupt_reports_status_and_returns_130(
             cli.sys.stderr,
         )
     ]
+
+
+def test_post_settlement_verifier_requires_full_amf_authority_reaudit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cohort_id = "cohort-verifier"
+    session_id = f"{cohort_id}-session-0001"
+    workspace = tmp_path / "workspace"
+    evidence = tmp_path / "evidence"
+    workspace.mkdir()
+    evidence.mkdir()
+    prepared = SimpleNamespace(
+        cohort_root=tmp_path / "runs" / cohort_id,
+        briefing_bytes=b"{}\n",
+        plan=SimpleNamespace(
+            cohort_id=cohort_id,
+            sessions=(SimpleNamespace(session_id=session_id),),
+        ),
+    )
+
+    class FakeStore:
+        def __init__(self, _cohort_root: Path) -> None:
+            pass
+
+        def read_settlement(self) -> object:
+            return {"outcome": "SUCCEEDED"}
+
+        def read_receipt(self, selected_session: str) -> object:
+            assert selected_session == session_id
+            return {"status": "SUCCEEDED"}
+
+        def session_paths(self, selected_session: str) -> object:
+            assert selected_session == session_id
+            return SimpleNamespace(workspace=workspace, evidence=evidence)
+
+    monkeypatch.setattr(cli, "authenticate_plan_bundle", lambda *_args: prepared)
+    monkeypatch.setattr(cli, "RuntimeStore", FakeStore)
+    monkeypatch.setattr(cli, "SourceMaterializer", lambda _root: object())
+    monkeypatch.setattr(
+        cli,
+        "audit_amf_apparatus",
+        lambda *_args: (_ for _ in ()).throw(ValueError("authority closure failed")),
+    )
+    monkeypatch.setattr(
+        cli,
+        "AmfVerifierService",
+        lambda *_args, **_kwargs: pytest.fail(
+            "verifier service constructed before authority re-audit"
+        ),
+    )
+
+    result = cli.main(
+        [
+            "--data-root",
+            str(tmp_path),
+            "verifier",
+            "run",
+            "--cohort",
+            cohort_id,
+            "--session-id",
+            session_id,
+            "--target-id",
+            "fixture",
+            "--candidate",
+            "candidate.json",
+        ]
+    )
+
+    assert result == 2
 
 
 @pytest.mark.parametrize("bad_value", ["0", "-1", "nan", "inf"])
