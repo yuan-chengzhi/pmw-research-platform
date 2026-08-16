@@ -1,0 +1,15 @@
+.DS_Store
+.pytest_cache/
+__pycache__/
+*.py[cod]
+.venv/
+build/
+dist/
+*.egg-info/
+
+# Runtime state never belongs to the source repository.
+.local/
+runs/
+worlds/
+objects/
+source-cache/

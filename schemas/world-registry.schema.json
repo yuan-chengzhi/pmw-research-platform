@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/yuan-chengzhi/pmw-research-platform/schemas/world-registry.schema.json",
+  "title": "PMW research world registry",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "worlds"],
+  "properties": {
+    "schema": {"const": "PMW_RESEARCH_WORLD_REGISTRY_1"},
+    "worlds": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "repo", "world_ref", "seed_snapshot_ref", "registered_at"],
+        "properties": {
+          "name": {"type": "string", "pattern": "^[a-z][a-z0-9-]{0,62}$"},
+          "repo": {"type": "string", "minLength": 1},
+          "world_ref": {"type": "string", "pattern": "^refs/"},
+          "seed_snapshot_ref": {"type": "string", "pattern": "^snapshot/sha256/[0-9a-f]{64}$"},
+          "registered_at": {"type": "string", "format": "date-time"}
+        }
+      }
+    }
+  }
+}

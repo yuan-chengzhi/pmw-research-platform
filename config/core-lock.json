@@ -1,0 +1,15 @@
+{
+  "schema": "PMW_RESEARCH_CORE_LOCK_1",
+  "dependencies": {
+    "persistent-mathematical-worlds": {
+      "repository": "https://github.com/yuan-chengzhi/persistent-mathematical-worlds.git",
+      "commit": "4880f184c60bd34181302c5343ec0db95f154851",
+      "python_package": "pmw_r2"
+    },
+    "agent-math-frontier": {
+      "repository": "https://github.com/yuan-chengzhi/agent-math-frontier.git",
+      "commit": "c737df34c84b7a3274b5be74c604aadfcc445478",
+      "role": "problem-and-verifier-authority"
+    }
+  }
+}
