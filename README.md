@@ -3,8 +3,41 @@
 一个把长期数学状态与可替换研究 session 分开的通用运行平台。数学世界持续演进，
 实验只创建新的 cohort；不再为了每次运行复制一套 `M0i → M0i+1` apparatus。
 
+> **当前准确定位：** production-candidate 的 cohort/runtime 控制面，而不是已经包含
+> M01–M03 全部工具的 live multi-agent research plane。host 可以冻结共同数学状态、
+> 并发运行和结算 agents；同一 cohort 内的 agents 还不能实时查询同伴更新、调用
+> verifier 或通过 PMW 协调路线。
+
 > M04 仍然冻结且从未启动。安装、测试、生成 plan 或读取状态都不会自动启动
 > M04，也不会发起模型、OAuth 或网络请求；真实运行必须由操作者显式发起。
+
+## 与 PMW 及问题库的关系
+
+| 仓库 | 单一职责 |
+|---|---|
+| [`agent-math-frontier`](https://github.com/yuan-chengzhi/agent-math-frontier) | 问题卡、形式化状态、candidate schema 与 verifier 权威 |
+| `persistent-mathematical-worlds` | admission、record、snapshot、provenance 与 Git-backed 持久数学世界语义 |
+| **本仓库** | cohort、backend、并发、context、生命周期、host publication、证据与结算 |
+| [`pmw-research-data`](https://github.com/yuan-chengzhi/pmw-research-data)（private） | M02–M03 的可移植 world bundle、loss-aware situation 与 63/63 artifact closure |
+
+本仓库不是原 PMW 的 fork、复制品或替代品。它从 core lock 固定的精确 PMW commit
+物化并审计 `pmw_r2`，把 PMW 用作持久状态内核；runtime/scheduler 仍由本仓库负责。
+同理，它消费问题库固定的 target/verifier 权威，但不在这里重新定义数学问题。
+
+## 能力边界一览
+
+| 能力 | 当前已有 | 当前尚无 |
+|---|---|---|
+| 共同数学状态 | 每个 cohort 冻结同一 snapshot 与完整 briefing；operator 可 `status/get/delta` | 运行中 agent-facing 的 PMW `search/get/updates_since` |
+| 多 agent 执行 | 任意 session 数、固定并发、独立 workspace/cache/evidence、统一 settlement | 运行中 ballot/barrier、路线抢占与 peer-update 通知 |
+| PMW 写回 | 成功停止后由 trusted host 绑定身份并写回 | 同一 cohort 其他在途 agent 对新写回的实时可见性 |
+| Verifier | 已结算 candidate 的 host-authoritative 复验与不可变 receipt | agent-facing live verifier、实时 `verifier_feedback` |
+| Artifact | SHA-256 CAS、引用闭包与结算后 candidate capture | live `submit_artifact`/验证反馈工具 |
+| Bash/output | Pi 内置 `bash` 可由操作者显式开启；transport frame/stderr evidence 有界 | tool-result → model 的 bounded-output projection 与 `output_read` |
+| Context | backend window、cohort 默认值或逐 session 覆盖 | 把 context override 与任意外部 extension 安全组合的通用证明 |
+
+因此，“可协调”目前有两个不同答案：host 已能协调共同输入、并发、生命周期、最终
+写回和结算；agents 尚不能像 M02/M03 那样在运行中用 PMW 互相协调数学路线。
 
 ## 运行模型
 
@@ -140,7 +173,7 @@ admission 成功后、receipt 落盘前崩溃，必须由操作者按 PMW admiss
 | Backend contract | 公开身份无凭证值；请求身份由 host 固定；结果有界且无 session 身份 |
 | Publish API | launch 明示 `DISABLED`/`PMW_BOUND`；host 注入 `SessionSpec` 并在写回前验证 artifact 引用 |
 | Verifier | 结算后由 host 捕获 candidate 到 CAS、重执行 briefing-bound 的 pinned AMF verifier，并持久化不可变 receipt |
-| Safety | lifecycle 单一权威、有界输出、聚合资源 guard、独立工作/缓存路径；不把正常研究行为当入侵 |
+| Safety | lifecycle 单一权威、transport evidence 有界、聚合资源 guard、独立工作/缓存路径；不把正常研究行为当入侵 |
 
 基础包可以独立安装。需要读写 PMW world 时，先从操作者指定的本地 Git object
 database 把 source lock 中的 PMW commit 物化进 managed `source-cache`；CLI 会在完整
@@ -149,7 +182,44 @@ tree audit 后直接从该只读树加载 `pmw_r2`，不要求旧工作树、edi
 source identity。公共 CI 不持有跨私有仓库凭证，因此依赖真实 PMW 的连续性用例
 单独运行；runtime 契约与 command 验收不需要模型。
 
-## 操作面
+## 从干净 clone 开始
+
+日常实验的操作面已经收敛为：
+
+```text
+plan → preflight → start → status → verifier（如有 candidate）
+```
+
+第一次机器初始化仍需一次性完成“恢复 world + 物化两个 locked source”；当前没有把
+私有仓库访问和本机 Pi/OAuth 配置伪装成一条万能 `init` 命令。
+
+要求 Python 3.11+。安装 platform：
+
+```bash
+git clone https://github.com/yuan-chengzhi/pmw-research-platform
+cd pmw-research-platform
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e '.[dev]'
+```
+
+有 private data repo 权限时，可以恢复当前 M03 数学世界；这不会恢复原始模型 frames
+或 workspace，只恢复可继承的 174-admission world 与 63/63 artifacts：
+
+```bash
+gh repo clone yuan-chengzhi/pmw-research-data ~/Documents/pmw-research-data
+cd ~/Documents/pmw-research-data
+python3 scripts/audit.py
+git init --bare worlds/math-frontier.git
+git --git-dir=worlds/math-frontier.git fetch \
+  "$(pwd)/worlds/math-frontier.bundle" \
+  refs/pmw/frontier-choice-world:refs/pmw/frontier-choice-world
+```
+
+然后按下一节物化 locked source、注册 exact snapshot，再执行日常五步。若没有该 private
+data repo 权限，应注册自己的 PMW world，而不是假定 platform 源码仓库自带 M03 数据。
+
+## 完整操作面
 
 ```bash
 # 先从已审查的本地 Git object database 物化 core-lock 精确源码；不会 fetch
@@ -164,7 +234,7 @@ pmw-research source audit persistent-mathematical-worlds
 pmw-research world add math-frontier \
   --repo ~/Documents/pmw-research-data/worlds/math-frontier.git \
   --world-ref refs/pmw/frontier-choice-world \
-  --snapshot snapshot/sha256/...
+  --snapshot snapshot/sha256/803bfcd0604ff01c9b560d9e82d6e2a9f606d6c36312418f2e95cf1193f3535a
 
 # 查看完整数学状态
 pmw-research world status math-frontier
@@ -175,20 +245,33 @@ pmw-research world delta math-frontier --since snapshot/sha256/...
 # 生成冻结输入；这一步不会运行 session
 pmw-research session plan \
   --world math-frontier --count 8 --concurrency 4 \
-  --profile research-default
+  --profile research-default --cohort-id local-model-free-smoke-001
 
-# 先复制 example 并替换其中已审查 worker 的绝对路径；再只读预检精确 launch 配置
+# 为仓库自带的 zero-model worker 生成本机绝对路径配置
+python - <<'PY'
+import json
+from pathlib import Path
+
+root = Path.cwd().resolve()
+config = json.loads((root / "examples/command-backend.json").read_text())
+config["argv"] = [str(root / "examples/model-free-worker.py")]
+Path("/tmp/pmw-model-free-backend.json").write_text(
+    json.dumps(config, indent=2) + "\n"
+)
+PY
+
+# 只读预检精确 launch 配置
 # preflight 不建 runtime、不启动 backend
 # amf-production 是默认 scope；runtime-only 只表示 transport 就绪
 pmw-research session preflight \
-  --cohort cohort-... --backend command \
-  --backend-config ./examples/command-backend.json \
+  --cohort local-model-free-smoke-001 --backend command \
+  --backend-config /tmp/pmw-model-free-backend.json \
   --startup-seconds 60 --wall-seconds 86400 --stop-grace-seconds 10
 
 # 显式运行；start 会在 launch claim 内重做 required readiness 检查
 pmw-research session start \
-  --cohort cohort-... --backend command \
-  --backend-config ./examples/command-backend.json \
+  --cohort local-model-free-smoke-001 --backend command \
+  --backend-config /tmp/pmw-model-free-backend.json \
   --startup-seconds 60 --wall-seconds 86400 --stop-grace-seconds 10
 
 # Pi/account 路由希望采用约 400k 总窗口时；值会冻结进 launch.json
@@ -199,7 +282,7 @@ pmw-research session start \
   --session-context-window cohort-...-session-0002=360000
 
 # 纯读取，不启动、不恢复任何进程
-pmw-research session status --cohort cohort-...
+pmw-research session status --cohort local-model-free-smoke-001
 
 # 仅对已结算 session 的 workspace-relative candidate 做 host 复验
 pmw-research verifier run \
@@ -211,15 +294,16 @@ pmw-research verifier run \
 RuntimeClaim 后会重做可变的 backend pin、source 和 apparatus 检查，然后才创建
 `launch.json`；其 canonical 公开证据与哈希会进入 launch 并下发到 session invocation。
 
-当前产物应准确理解为“通用 cohort/runtime production candidate”。它已有结算后的
-host verifier，但尚无 agent-facing 的 live verifier tool，也没有 M01–M03 那种实时
-PMW read/query/peer-update 协调 tool plane。这些是后续独立能力层，不能从当前
-runtime 验收中推导出来。
+当前产物应准确理解为“通用 cohort/runtime production candidate”。顶部能力矩阵中
+标明的 live research tool plane 是后续独立能力层，不能从当前 runtime 验收中
+推导出来。下一步最小通用层应优先补 live PMW read/delta/checkpoint、live artifact +
+verifier feedback，以及 bounded Bash projection；M02/M03 的 treatment、ballot 和
+target-specific 长任务则更适合作为可选 experiment/plugin，而不是重新塞回 runtime core。
 
-运行数据默认位于
-`~/Documents/pmw-research-data/{worlds,runs,objects,source-cache,archive}`，不进入
-Git。问题/验证器权威属于 `agent-math-frontier`，数学状态权威属于
-`persistent-mathematical-worlds`，本仓库只负责通用控制面与 runtime。
+live 运行数据默认位于
+`~/Documents/pmw-research-data/{worlds,runs,objects,source-cache,archive}`，不会原样
+进入本仓库。独立 private data repo 只发布经过审计的可移植 world/situation/artifact
+closure，排除 cache、私有 source materialization 和原始 frames。
 
 M01–M03 是历史实验和迁移证据，不是工作流模板。更详细的设计边界见
 [Architecture](docs/ARCHITECTURE.md)，迁移证据见 [Migration](docs/MIGRATION.md)，
