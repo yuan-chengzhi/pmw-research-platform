@@ -1,0 +1,26 @@
+{
+  "schema": "PMW_PI_RPC_BACKEND_CONFIG_1",
+  "name": "pinned-local-pi",
+  "node_path": "/absolute/path/to/reviewed/node",
+  "pi_entrypoint": "/absolute/path/to/pi-coding-agent/dist/cli.js",
+  "pi_agent_dir": "/absolute/path/to/private-pi-agent-dir",
+  "provider": "REPLACE_WITH_PROVIDER",
+  "model": "REPLACE_WITH_PINNED_MODEL",
+  "thinking": "max",
+  "auth_kind": "oauth",
+  "account_label": "replace-with-stable-local-account-label",
+  "tools": [],
+  "extensions": [],
+  "result_path": "pi-result.json",
+  "limits": {
+    "maximum_prompt_bytes": 268435456,
+    "maximum_result_bytes": 8388608,
+    "maximum_jsonl_line_bytes": 16777216,
+    "maximum_stdout_bytes": 1073741824,
+    "maximum_retained_frame_bytes": 67108864,
+    "maximum_stderr_bytes": 268435456,
+    "maximum_retained_stderr_bytes": 1048576,
+    "maximum_frame_count": 1000000,
+    "response_timeout_seconds": 300
+  }
+}

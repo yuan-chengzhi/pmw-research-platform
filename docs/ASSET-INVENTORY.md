@@ -10,13 +10,30 @@ launchers still bind several physical paths.
 
 | Repository | Authority | Keep active |
 |---|---|---|
-| `pmw-research-platform` | Model-free control plane: world/briefing/artifact/plan identity, scheduling primitives and safety policy | Yes; canonical future runtime repository, but no real agent launcher yet |
+| `pmw-research-platform` | World/briefing/artifact/plan identity plus the generic session runtime and safety policy | Yes; canonical active runtime repository |
 | `agent-math-frontier` | Problem statements, formalization status, verifier registry and target portfolio | Yes; mathematical problem authority |
 | `persistent-mathematical-worlds` | Typed PMW records, snapshots, provenance and world semantics | Yes; state-semantic authority |
 
 `world-kernel` is a remotely preserved implementation reference, not a fourth
-canonical authority. The generic platform should absorb or replace its small
-runtime adapter surface and then stop depending on a physical worktree.
+canonical authority. Its small runtime-adapter role is now represented by the
+generic backend contract in `pmw-research-platform`; new cohorts do not need a
+physical `world-kernel` worktree.
+
+## Active runtime implementation
+
+The canonical platform now has one host lifecycle/settlement path and two
+adapters:
+
+| Component | Validation state | External activity in this implementation pass |
+|---|---|---|
+| Command adapter | Model-free process-group, output-capture, result and cancellation tests | Local fake workers only |
+| Pi RPC adapter | Fake RPC protocol/lifecycle tests; local Pi installation and OAuth type loaded read-only for config compatibility | No new real model/provider canary, network request or model token use |
+| Resource guard | Quiescent initial/terminal aggregate scans plus live disk-reserve tests | Local temporary trees only |
+
+`runtime/launch.json` binds the backend, the host's single
+startup/session-wall/stop-grace policy, and a publication identity of either
+`DISABLED` or `PMW_BOUND`. M04 remains frozen: no M04 run root, provider call or
+settlement was created while implementing or validating this runtime.
 
 ## Frontier campaign Git topology
 

@@ -1,0 +1,14 @@
+{
+  "schema": "PMW_COMMAND_BACKEND_CONFIG_1",
+  "name": "trusted-local-worker",
+  "argv": [
+    "/absolute/path/to/reviewed/trusted-worker"
+  ],
+  "argv_is_public": true,
+  "result_path": "result.json",
+  "capture": {
+    "maximum_retained_bytes": 1048576,
+    "maximum_observed_bytes": 1073741824,
+    "tail_bytes": 4096
+  }
+}

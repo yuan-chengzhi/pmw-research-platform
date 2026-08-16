@@ -3,7 +3,7 @@
 This module deliberately does not kill processes, scan workspaces, or admit
 evidence.  It gives the runtime two small primitives:
 
-* a validated mapping from an observed condition to its scope of effect; and
+* a validated mapping from an observed condition to its policy action; and
 * an output accumulator that bounds retained bytes while continuing to drain,
   count, hash, and tail the observed stream.
 
@@ -35,7 +35,7 @@ class SafetyProfileError(ValueError):
 
 
 class Disposition(str, Enum):
-    """The largest scope an observed condition is allowed to affect."""
+    """Policy action for an observation; evidence records scope separately."""
 
     SESSION_STOP = "SESSION_STOP"
     JOB_STOP = "JOB_STOP"
@@ -156,14 +156,18 @@ class TreeLimits:
         else:
             raise ValueError("scan_mode is invalid")
 
-    def file_limit_disposition(
+    def legacy_file_limit_disposition(
         self,
         size: int,
         *,
         profile: "SafetyProfile",
         code: str,
     ) -> Disposition | None:
-        """Return the configured disposition only when a file cap exists."""
+        """Interpret retained legacy metadata without enforcing it.
+
+        The generic :class:`ResourceGuard` deliberately does not call this
+        helper.  It exists only for inspecting historical profile intent.
+        """
 
         if type(size) is not int or size < 0:
             raise ValueError("size must be a non-negative integer")
@@ -208,21 +212,37 @@ class CaptureAppendOutcome:
 
 @dataclass(frozen=True)
 class CaptureSnapshot:
-    """Immutable state of one captured stream."""
+    """Immutable state of one captured stream.
+
+    ``retained_bytes`` accounts for the bounded prefix selected for retention.
+    ``retained`` is that prefix only when ``retained_content_in_snapshot`` is
+    true; streaming callers can externalize it and receive ``None`` here.
+    """
 
     observed_bytes: int
     retained_bytes: int
-    retained: bytes
+    retained: bytes | None
     tail: bytes
     observed_sha256: str
     truncated: bool
     observed_safety_cap_exceeded: bool
     terminal_disposition: Disposition | None
 
+    @property
+    def retained_content_in_snapshot(self) -> bool:
+        """Whether ``retained`` contains the accounted prefix bytes."""
+
+        return self.retained is not None
+
 
 @dataclass(frozen=True)
 class SafetyProfile:
-    """Validated, immutable safety policy loaded from JSON."""
+    """Validated, immutable safety policy loaded from JSON.
+
+    ``legacy_captures`` preserves frozen profile identity.  Generic runtime
+    output limits belong to each backend's launch identity because command
+    streams and Pi RPC frames are not interchangeable.
+    """
 
     name: str
     sha256: str
@@ -230,7 +250,7 @@ class SafetyProfile:
     disk_guard: DiskGuard
     workspace: TreeLimits
     runtime_cache: TreeLimits
-    captures: Mapping[str, CaptureLimits]
+    legacy_captures: Mapping[str, CaptureLimits]
 
     def __post_init__(self) -> None:
         if type(self.name) is not str or _PROFILE_NAME.fullmatch(self.name) is None:
@@ -255,8 +275,9 @@ class SafetyProfile:
             self.runtime_cache, TreeLimits
         ):
             raise TypeError("tree limits are invalid")
-        if set(self.captures) != {"bash", "long_job"} or any(
-            not isinstance(value, CaptureLimits) for value in self.captures.values()
+        if set(self.legacy_captures) != {"bash", "long_job"} or any(
+            not isinstance(value, CaptureLimits)
+            for value in self.legacy_captures.values()
         ):
             raise ValueError("capture limits are incomplete")
 
@@ -268,22 +289,30 @@ class SafetyProfile:
         except KeyError as exc:
             raise KeyError(f"unclassified safety code: {code}") from exc
 
-    def capture_limits(self, kind: str) -> CaptureLimits:
+    def legacy_capture_limits(self, kind: str) -> CaptureLimits:
+        """Inspect historical campaign capture metadata; not runtime policy."""
+
         try:
-            return self.captures[kind]
+            return self.legacy_captures[kind]
         except KeyError as exc:
             raise KeyError(f"unknown capture kind: {kind}") from exc
 
-    def new_capture(self, kind: str) -> "BoundedCaptureAccumulator":
+    def new_legacy_capture(self, kind: str) -> "BoundedCaptureAccumulator":
+        """Build a capture matching legacy metadata for audit/replay tooling."""
+
         return BoundedCaptureAccumulator(
-            self.capture_limits(kind),
+            self.legacy_capture_limits(kind),
             observed_cap_disposition=self.disposition(
                 "OBSERVED_OUTPUT_SAFETY_CAP"
             ),
         )
 
-    def workspace_file_limit_disposition(self, size: int) -> Disposition | None:
-        return self.workspace.file_limit_disposition(
+    def legacy_workspace_file_limit_disposition(
+        self, size: int
+    ) -> Disposition | None:
+        """Inspect the historical workspace file-cap policy metadata."""
+
+        return self.workspace.legacy_file_limit_disposition(
             size,
             profile=self,
             code="WORKSPACE_FILE_SIZE_EXCEEDED",
@@ -297,6 +326,8 @@ class BoundedCaptureAccumulator:
     keeps counting and hashing every chunk and maintains a bounded tail.  It
     only signals the profile's job-local disposition after the much larger
     observed-output safety cap is crossed; the caller owns process control.
+    With ``retain_content=False`` it accounts for the same prefix but leaves
+    storage to the caller, avoiding a duplicate in-memory copy.
     """
 
     def __init__(
@@ -304,15 +335,19 @@ class BoundedCaptureAccumulator:
         limits: CaptureLimits,
         *,
         observed_cap_disposition: Disposition = Disposition.JOB_STOP,
+        retain_content: bool = True,
     ) -> None:
         if not isinstance(limits, CaptureLimits):
             raise TypeError("limits must be CaptureLimits")
         if observed_cap_disposition is not Disposition.JOB_STOP:
             raise ValueError("observed output safety cap must be JOB_STOP")
+        if type(retain_content) is not bool:
+            raise TypeError("retain_content must be bool")
         self._limits = limits
         self._observed_cap_disposition = observed_cap_disposition
         self._observed_bytes = 0
-        self._retained = bytearray()
+        self._retained_bytes = 0
+        self._retained = bytearray() if retain_content else None
         self._tail = bytearray()
         self._digest = hashlib.sha256()
         self._safety_cap_exceeded = False
@@ -328,13 +363,16 @@ class BoundedCaptureAccumulator:
         if not isinstance(chunk, (bytes, bytearray, memoryview)):
             raise TypeError("chunk must be bytes-like")
         selected = bytes(chunk)
-        before_retained = len(self._retained)
+        before_retained = self._retained_bytes
         self._observed_bytes += len(selected)
         self._digest.update(selected)
 
-        room = self._limits.maximum_retained_bytes - len(self._retained)
+        room = self._limits.maximum_retained_bytes - self._retained_bytes
         if room > 0:
-            self._retained.extend(selected[:room])
+            retained_bytes_added = min(room, len(selected))
+            if self._retained is not None:
+                self._retained.extend(selected[:retained_bytes_added])
+            self._retained_bytes += retained_bytes_added
 
         if self._limits.tail_bytes:
             if len(selected) >= self._limits.tail_bytes:
@@ -355,8 +393,8 @@ class BoundedCaptureAccumulator:
         )
         return CaptureAppendOutcome(
             observed_bytes_added=len(selected),
-            retained_bytes_added=len(self._retained) - before_retained,
-            truncated=self._observed_bytes > len(self._retained),
+            retained_bytes_added=self._retained_bytes - before_retained,
+            truncated=self._observed_bytes > self._retained_bytes,
             safety_cap_crossed=self._safety_cap_exceeded and not was_exceeded,
             disposition=disposition,
         )
@@ -364,11 +402,13 @@ class BoundedCaptureAccumulator:
     def snapshot(self) -> CaptureSnapshot:
         return CaptureSnapshot(
             observed_bytes=self._observed_bytes,
-            retained_bytes=len(self._retained),
-            retained=bytes(self._retained),
+            retained_bytes=self._retained_bytes,
+            retained=(
+                bytes(self._retained) if self._retained is not None else None
+            ),
             tail=bytes(self._tail),
             observed_sha256=self._digest.hexdigest(),
-            truncated=self._observed_bytes > len(self._retained),
+            truncated=self._observed_bytes > self._retained_bytes,
             observed_safety_cap_exceeded=self._safety_cap_exceeded,
             terminal_disposition=(
                 self._observed_cap_disposition
@@ -598,7 +638,7 @@ def validate_profile(value: object) -> SafetyProfile:
         disk_guard=disk_guard,
         workspace=_parse_tree(root["workspace"], label="workspace"),
         runtime_cache=_parse_tree(root["runtime_cache"], label="runtime_cache"),
-        captures=MappingProxyType(captures),
+        legacy_captures=MappingProxyType(captures),
     )
 
 

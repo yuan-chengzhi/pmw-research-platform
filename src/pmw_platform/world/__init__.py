@@ -6,6 +6,7 @@ from .legacy_frontier import (
     build_legacy_frontier_view,
 )
 from .records import (
+    RESEARCH_CONTRIBUTION_SCHEMA,
     MAXIMUM_RECORD_BYTES,
     RESEARCH_KINDS,
     RESEARCH_RECORD_SCHEMA,
@@ -21,6 +22,7 @@ from .store import (
     ResearchWorld,
     ResearchWorldError,
     WorldAdmission,
+    load_writer_authority,
 )
 from .situation import (
     MathematicalSituation,
@@ -36,6 +38,7 @@ __all__ = [
     "MAXIMUM_RECORD_BYTES",
     "MathematicalSituation",
     "PmwWriterAuthority",
+    "RESEARCH_CONTRIBUTION_SCHEMA",
     "PublishResult",
     "RESEARCH_KINDS",
     "RESEARCH_RECORD_SCHEMA",
@@ -47,5 +50,6 @@ __all__ = [
     "WorldAdmission",
     "build_legacy_frontier_view",
     "build_mathematical_situation",
+    "load_writer_authority",
     "SITUATION_SCHEMA",
 ]

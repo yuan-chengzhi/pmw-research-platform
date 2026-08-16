@@ -48,6 +48,8 @@ else:
 
 
 DEFAULT_WORLD_REF = "refs/pmw/research-world"
+WRITER_AUTHORITY_SCHEMA = "PMW_WRITER_AUTHORITY_1"
+MAXIMUM_WRITER_AUTHORITY_BYTES = 65_536
 _SNAPSHOT_REF = re.compile(r"^snapshot/sha256/[0-9a-f]{64}$")
 _ADMISSION_REF = re.compile(r"^admission/sha256/[0-9a-f]{64}$")
 _RECEIPT_REF = re.compile(r"^receipt/sha256/[0-9a-f]{64}$")
@@ -133,10 +135,10 @@ def _decode_json_or_text(raw: bytes) -> object:
 class PmwWriterAuthority:
     """Existing PMW capability used by the platform's trusted host writer.
 
-    This is durable world configuration, not a session credential.  A future
-    runtime must authenticate each session to an outer broker. Its verified
-    identity will be recorded in :class:`ResearchRecord` while the stable host
-    performs the PMW admission.
+    This is durable trusted-host configuration, not a backend credential.  The
+    runtime authenticates each :class:`SessionSpec`, keeps this authority out
+    of the backend request, and records the session identity in the resulting
+    :class:`ResearchRecord` while the host performs PMW admission.
     """
 
     channel_ref: str
@@ -205,6 +207,126 @@ class PmwWriterAuthority:
             maximum_content_bytes=self.maximum_content_bytes,
             maximum_parent_refs=self.maximum_parent_refs,
         )
+
+    def to_value(self) -> dict[str, object]:
+        return {
+            "schema": WRITER_AUTHORITY_SCHEMA,
+            "channel_ref": self.channel_ref,
+            "invocation_ref": self.invocation_ref,
+            "process_ref": self.process_ref,
+            "principal_ref": self.principal_ref,
+            "episode_ref": self.episode_ref,
+            "capability_ref": self.capability_ref,
+            "scope_ref": self.scope_ref,
+            "policy_ref": self.policy_ref,
+            "policy_fingerprint": self.policy_fingerprint,
+            "maximum_calls": self.maximum_calls,
+            "maximum_delivery_attempts": self.maximum_delivery_attempts,
+            "maximum_content_bytes": self.maximum_content_bytes,
+            "maximum_parent_refs": self.maximum_parent_refs,
+        }
+
+    @classmethod
+    def from_value(cls, value: object) -> "PmwWriterAuthority":
+        expected = {
+            "schema",
+            "channel_ref",
+            "invocation_ref",
+            "process_ref",
+            "principal_ref",
+            "episode_ref",
+            "capability_ref",
+            "scope_ref",
+            "policy_ref",
+            "policy_fingerprint",
+            "maximum_calls",
+            "maximum_delivery_attempts",
+            "maximum_content_bytes",
+            "maximum_parent_refs",
+        }
+        if type(value) is not dict or set(value) != expected:
+            _fail("MALFORMED_WRITER_AUTHORITY", "fields")
+        if value.get("schema") != WRITER_AUTHORITY_SCHEMA:
+            _fail("MALFORMED_WRITER_AUTHORITY", "schema")
+        return cls(
+            channel_ref=value.get("channel_ref"),  # type: ignore[arg-type]
+            invocation_ref=value.get("invocation_ref"),  # type: ignore[arg-type]
+            process_ref=value.get("process_ref"),  # type: ignore[arg-type]
+            principal_ref=value.get("principal_ref"),  # type: ignore[arg-type]
+            episode_ref=value.get("episode_ref"),  # type: ignore[arg-type]
+            capability_ref=value.get("capability_ref"),  # type: ignore[arg-type]
+            scope_ref=value.get("scope_ref"),  # type: ignore[arg-type]
+            policy_ref=value.get("policy_ref"),  # type: ignore[arg-type]
+            policy_fingerprint=value.get("policy_fingerprint"),  # type: ignore[arg-type]
+            maximum_calls=value.get("maximum_calls"),  # type: ignore[arg-type]
+            maximum_delivery_attempts=value.get("maximum_delivery_attempts"),  # type: ignore[arg-type]
+            maximum_content_bytes=value.get("maximum_content_bytes"),  # type: ignore[arg-type]
+            maximum_parent_refs=value.get("maximum_parent_refs"),  # type: ignore[arg-type]
+        )
+
+
+def load_writer_authority(path: str | os.PathLike[str]) -> PmwWriterAuthority:
+    """Load an owner-only host capability without exposing it to a backend."""
+
+    supplied = Path(path).expanduser()
+    descriptor: int | None = None
+    try:
+        named = supplied.lstat()
+        if stat.S_ISLNK(named.st_mode) or not stat.S_ISREG(named.st_mode):
+            _fail("WRITER_AUTHORITY_UNSAFE")
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(supplied, flags)
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or named.st_dev != metadata.st_dev
+            or named.st_ino != metadata.st_ino
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_mode & 0o077
+            or not 1 <= metadata.st_size <= MAXIMUM_WRITER_AUTHORITY_BYTES
+        ):
+            _fail("WRITER_AUTHORITY_UNSAFE")
+        chunks: list[bytes] = []
+        remaining = MAXIMUM_WRITER_AUTHORITY_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, min(65_536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        if len(raw) != metadata.st_size:
+            _fail("WRITER_AUTHORITY_UNSAFE")
+    except ResearchWorldError:
+        raise
+    except OSError as exc:
+        raise ResearchWorldError("WRITER_AUTHORITY_UNAVAILABLE") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+    def reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError("duplicate key")
+            result[key] = item
+        return result
+
+    def reject_number(_value: str) -> NoReturn:
+        raise ValueError("floating-point number")
+
+    try:
+        value = json.loads(
+            raw.decode("utf-8", errors="strict"),
+            object_pairs_hook=reject_duplicates,
+            parse_float=reject_number,
+            parse_constant=reject_number,
+        )
+    except (UnicodeError, json.JSONDecodeError, ValueError, RecursionError) as exc:
+        raise ResearchWorldError("MALFORMED_WRITER_AUTHORITY", "JSON") from exc
+    return PmwWriterAuthority.from_value(value)
 
 
 @dataclass(frozen=True)

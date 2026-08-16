@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 
 
 RESEARCH_RECORD_SCHEMA = "PMW_RESEARCH_RECORD_1"
+RESEARCH_CONTRIBUTION_SCHEMA = "PMW_RESEARCH_CONTRIBUTION_1"
 RESEARCH_KINDS = frozenset({
     "NOTE",
     "NEED",
@@ -46,6 +47,16 @@ _FIELDS = frozenset({
     "cohort_id",
     "session_id",
     "base_snapshot_ref",
+    "kind",
+    "problem_ids",
+    "parent_refs",
+    "title",
+    "body",
+    "artifact_refs",
+    "payload",
+})
+_CONTRIBUTION_FIELDS = frozenset({
+    "schema",
     "kind",
     "problem_ids",
     "parent_refs",
@@ -294,6 +305,44 @@ class ResearchContribution:
         if type(value) is not dict:
             raise AssertionError("research contribution payload is not an object")
         return value
+
+    def to_value(self) -> dict[str, object]:
+        """Return the identity-free wire value accepted from a backend."""
+
+        return {
+            "schema": RESEARCH_CONTRIBUTION_SCHEMA,
+            "kind": self.kind,
+            "problem_ids": list(self.problem_ids),
+            "parent_refs": list(self.parent_refs),
+            "title": self.title,
+            "body": self.body,
+            "artifact_refs": list(self.artifact_refs),
+            "payload": self.payload,
+        }
+
+    @classmethod
+    def from_value(cls, value: object) -> "ResearchContribution":
+        """Validate one untrusted, identity-free backend proposal."""
+
+        if type(value) is not dict or set(value) != _CONTRIBUTION_FIELDS:
+            _fail("MALFORMED_CONTRIBUTION", "fields")
+        if value.get("schema") != RESEARCH_CONTRIBUTION_SCHEMA:
+            _fail("MALFORMED_CONTRIBUTION", "schema")
+        for label in ("problem_ids", "parent_refs", "artifact_refs"):
+            if type(value.get(label)) is not list:
+                _fail("MALFORMED_CONTRIBUTION", label)
+        payload = value.get("payload")
+        if type(payload) is not dict:
+            _fail("MALFORMED_CONTRIBUTION", "payload")
+        return cls(
+            kind=value.get("kind"),  # type: ignore[arg-type]
+            title=value.get("title"),  # type: ignore[arg-type]
+            body=value.get("body"),  # type: ignore[arg-type]
+            problem_ids=value["problem_ids"],  # type: ignore[arg-type]
+            parent_refs=value["parent_refs"],  # type: ignore[arg-type]
+            artifact_refs=value["artifact_refs"],  # type: ignore[arg-type]
+            payload=payload,
+        )
 
     def bind(self, spec: "SessionSpec") -> "ResearchRecord":
         """Let the host inject the complete immutable session identity."""

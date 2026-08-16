@@ -3,16 +3,34 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
+import re
 import secrets
+import signal
 import sys
-from typing import Sequence
+from typing import Awaitable, Sequence, TypeVar
 
 from .artifacts import ArtifactStore, ArtifactStoreError
-from .config import ConfigError, WorldRegistration, WorldRegistry
+from .config import (
+    ConfigError,
+    WorldRegistration,
+    WorldRegistry,
+    default_data_root,
+)
+from .runtime.auth import RuntimeAuthenticationError, authenticate_plan_bundle
+from .runtime.command import CommandBackendError, load_command_backend
+from .runtime.orchestrator import (
+    RuntimeLimits,
+    RuntimeOrchestrationError,
+    run_prepared_cohort,
+)
+from .runtime.publish import PmwContributionPublisher
 from .runtime.safety import SafetyProfileError, load_named_profile
+from .runtime.store import RuntimeStore, RuntimeStoreError
 from .sessions import CohortPlan, PlanStoreError, plan_sha256, save_plan
 from .source_lock import SourceLockError, load_core_lock
 from .world import (
@@ -20,11 +38,49 @@ from .world import (
     ResearchWorldError,
     build_legacy_frontier_view,
     build_mathematical_situation,
+    load_writer_authority,
 )
 
 
 class CommandLineError(ValueError):
     """A concise argument error rendered through the common JSON boundary."""
+
+
+_T = TypeVar("_T")
+
+
+async def _with_latched_sigint(operation: Awaitable[_T]) -> _T:
+    """Turn every Ctrl-C during settlement into the same cancellation request.
+
+    ``asyncio.run`` otherwise escalates a second SIGINT to a synchronous
+    ``KeyboardInterrupt`` which can tear down shielded process cleanup.  The
+    runtime already handles repeated task cancellation, so this owner-facing
+    wrapper keeps SIGINT cooperative until a durable settlement exists.
+    """
+
+    task = asyncio.current_task()
+    if task is None:
+        raise RuntimeError("runtime task is unavailable")
+    loop = asyncio.get_running_loop()
+    previous = signal.getsignal(signal.SIGINT)
+    installed = False
+
+    def request_stop(_signum: int, _frame: object) -> None:
+        loop.call_soon_threadsafe(task.cancel)
+
+    try:
+        if previous is not signal.SIG_IGN:
+            try:
+                signal.signal(signal.SIGINT, request_stop)
+                installed = True
+            except ValueError:
+                # A library caller may invoke the CLI from a non-main thread;
+                # asyncio's normal cancellation semantics remain available.
+                pass
+        return await operation
+    finally:
+        if installed:
+            signal.signal(signal.SIGINT, previous)
 
 
 class JsonArgumentParser(argparse.ArgumentParser):
@@ -47,7 +103,21 @@ def _bounded_integer(minimum: int, maximum: int):
     return parse
 
 
-def _emit(value: object, *, stream: object = sys.stdout) -> None:
+def _positive_number(value: str) -> float:
+    try:
+        selected = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a number") from error
+    if not 0 < selected < float("inf"):
+        raise argparse.ArgumentTypeError("must be positive and finite")
+    return selected
+
+
+_COHORT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+def _emit(value: object, *, stream: object | None = None) -> None:
+    selected_stream = sys.stdout if stream is None else stream
     print(
         json.dumps(
             value,
@@ -56,7 +126,7 @@ def _emit(value: object, *, stream: object = sys.stdout) -> None:
             indent=2,
             sort_keys=True,
         ),
-        file=stream,
+        file=selected_stream,
     )
 
 
@@ -263,6 +333,97 @@ def _session_plan(args: argparse.Namespace) -> None:
     })
 
 
+def _runtime_data_root(args: argparse.Namespace) -> Path:
+    selected = default_data_root() if args.data_root is None else args.data_root
+    expanded = selected.expanduser()
+    if not expanded.is_absolute():
+        expanded = Path(os.path.abspath(expanded))
+    # Preserve an explicitly supplied symlink for the authentication/store
+    # boundary to reject.  Resolving it here would silently erase the spelling
+    # those strict readers are designed to validate.
+    return expanded
+
+
+def _runtime_cohort_id(value: object) -> str:
+    if type(value) is not str or _COHORT_ID.fullmatch(value) is None:
+        raise CommandLineError("cohort must be a canonical cohort ID")
+    return value
+
+
+def _session_start(args: argparse.Namespace) -> int:
+    """The sole explicit path from a saved plan to external backend work."""
+
+    cohort_id = _runtime_cohort_id(args.cohort)
+    prepared = authenticate_plan_bundle(_runtime_data_root(args), cohort_id)
+    if args.backend == "command":
+        backend = load_command_backend(args.backend_config)
+    elif args.backend == "pi":
+        # Lazy import keeps read-only/status operations independent of a Pi
+        # installation and cannot accidentally start a provider request.
+        from .runtime.pi import load_pi_backend
+
+        backend = load_pi_backend(args.backend_config)
+    else:  # argparse choices make this unreachable.
+        raise CommandLineError("unsupported runtime backend")
+
+    publisher = None
+    if args.writer_authority is not None:
+        publisher = PmwContributionPublisher.create(
+            prepared,
+            load_writer_authority(args.writer_authority),
+        )
+    limits = RuntimeLimits(
+        startup_seconds=args.startup_seconds,
+        session_wall_seconds=(
+            None if args.no_wall_limit else args.wall_seconds
+        ),
+        stop_grace_seconds=args.stop_grace_seconds,
+    )
+    try:
+        result = asyncio.run(
+            _with_latched_sigint(
+                run_prepared_cohort(
+                    prepared,
+                    backend,
+                    limits=limits,
+                    publisher=publisher,
+                )
+            )
+        )
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        status = RuntimeStore(prepared.cohort_root).read_status()
+        _emit(
+            {
+                "schema": "PMW_RUNTIME_INTERRUPTED_1",
+                "cohort_id": prepared.plan.cohort_id,
+                "status": status,
+            },
+            stream=sys.stderr,
+        )
+        return 130
+    _emit({
+        "schema": "PMW_RUNTIME_START_RESULT_1",
+        "cohort_id": prepared.plan.cohort_id,
+        "launch_sha256": result.launch_sha256,
+        "settlement_sha256": result.settlement_sha256,
+        "outcome": result.outcome,
+        "counts": result.settlement["counts"],
+        "runtime_root": str(prepared.cohort_root / "runtime"),
+    })
+    return 0 if result.outcome == "SUCCEEDED" else 1
+
+
+def _session_status(args: argparse.Namespace) -> None:
+    cohort_id = _runtime_cohort_id(args.cohort)
+    cohort_root = _runtime_data_root(args) / "runs" / cohort_id
+    status = RuntimeStore(cohort_root).read_status()
+    _emit({
+        "schema": "PMW_RUNTIME_STATUS_1",
+        "cohort_id": cohort_id,
+        "runtime": status,
+    })
+
+
 def _artifact_import(args: argparse.Namespace) -> None:
     imported = ArtifactStore(_registry(args).data_root).import_legacy(
         args.source, source_label=args.label
@@ -381,6 +542,39 @@ def build_parser() -> argparse.ArgumentParser:
     session_plan.add_argument("--cohort-id")
     session_plan.set_defaults(handler=_session_plan)
 
+    session_start = session_commands.add_parser(
+        "start",
+        help="explicitly run one authenticated cohort through a selected backend",
+    )
+    session_start.add_argument("--cohort", required=True)
+    session_start.add_argument(
+        "--backend", choices=("command", "pi"), required=True
+    )
+    session_start.add_argument("--backend-config", type=Path, required=True)
+    session_start.add_argument("--writer-authority", type=Path)
+    session_start.add_argument(
+        "--startup-seconds", type=_positive_number, default=60.0
+    )
+    wall = session_start.add_mutually_exclusive_group()
+    wall.add_argument(
+        "--wall-seconds", type=_positive_number, default=86_400.0
+    )
+    wall.add_argument(
+        "--no-wall-limit",
+        action="store_true",
+        help="do not impose a host session wall limit",
+    )
+    session_start.add_argument(
+        "--stop-grace-seconds", type=_positive_number, default=10.0
+    )
+    session_start.set_defaults(handler=_session_start)
+
+    session_status = session_commands.add_parser(
+        "status", help="read one launch without starting or resuming it"
+    )
+    session_status.add_argument("--cohort", required=True)
+    session_status.set_defaults(handler=_session_status)
+
     artifact = commands.add_parser(
         "artifact", help="import and audit content-addressed artifacts"
     )
@@ -405,13 +599,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     try:
         args = parser.parse_args(argv)
-        args.handler(args)
+        result = args.handler(args)
     except (
         ArtifactStoreError,
         CommandLineError,
         ConfigError,
         PlanStoreError,
         ResearchWorldError,
+        RuntimeAuthenticationError,
+        RuntimeOrchestrationError,
+        RuntimeStoreError,
+        CommandBackendError,
         SafetyProfileError,
         SourceLockError,
         ValueError,
@@ -425,4 +623,4 @@ def main(argv: Sequence[str] | None = None) -> int:
             stream=sys.stderr,
         )
         return 2
-    return 0
+    return result if type(result) is int else 0

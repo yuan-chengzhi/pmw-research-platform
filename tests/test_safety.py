@@ -49,9 +49,12 @@ def test_research_default_has_no_independent_75_mb_file_rule() -> None:
     m03_batch_bytes = 75_318_870
 
     assert research.workspace.maximum_file_bytes is None
-    assert research.workspace_file_limit_disposition(m03_batch_bytes) is None
     assert (
-        strict.workspace_file_limit_disposition(m03_batch_bytes)
+        research.legacy_workspace_file_limit_disposition(m03_batch_bytes)
+        is None
+    )
+    assert (
+        strict.legacy_workspace_file_limit_disposition(m03_batch_bytes)
         is Disposition.SESSION_STOP
     )
 
@@ -75,11 +78,46 @@ def test_retained_cap_truncates_without_terminating_capture() -> None:
     assert snapshot.observed_bytes == 8 * 1024
     assert snapshot.retained_bytes == 2 * 1024
     assert snapshot.retained == payload[: 2 * 1024]
+    assert snapshot.retained_content_in_snapshot
     assert snapshot.tail == payload[-128:]
     assert snapshot.observed_sha256 == hashlib.sha256(payload).hexdigest()
     assert snapshot.truncated
     assert not snapshot.observed_safety_cap_exceeded
     assert snapshot.terminal_disposition is None
+
+
+def test_streaming_capture_accounts_for_prefix_without_retaining_it() -> None:
+    limits = CaptureLimits(
+        maximum_retained_bytes=256 * 1024 * 1024,
+        maximum_observed_bytes=512 * 1024 * 1024,
+        tail_bytes=128,
+    )
+    capture = BoundedCaptureAccumulator(limits, retain_content=False)
+    chunk = bytes(range(256)) * 4096
+
+    retained_added = 0
+    digest = hashlib.sha256()
+    for _ in range(4):
+        outcome = capture.append(chunk)
+        retained_added += outcome.retained_bytes_added
+        digest.update(chunk)
+    snapshot = capture.finalize()
+
+    assert retained_added == 4 * len(chunk)
+    assert snapshot.observed_bytes == 4 * len(chunk)
+    assert snapshot.retained_bytes == 4 * len(chunk)
+    assert snapshot.retained is None
+    assert not snapshot.retained_content_in_snapshot
+    assert snapshot.tail == chunk[-128:]
+    assert snapshot.observed_sha256 == digest.hexdigest()
+    assert not snapshot.truncated
+
+
+def test_capture_rejects_non_boolean_retention_mode() -> None:
+    with pytest.raises(TypeError, match="retain_content must be bool"):
+        BoundedCaptureAccumulator(
+            CaptureLimits(1024, 2048, 64), retain_content=1  # type: ignore[arg-type]
+        )
 
 
 def test_observed_cap_signals_only_job_terminal_and_keeps_accounting() -> None:

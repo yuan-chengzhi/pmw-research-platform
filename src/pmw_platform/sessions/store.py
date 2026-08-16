@@ -244,8 +244,9 @@ def load_plan(path: str | os.PathLike[str]) -> CohortPlan:
         raise PlanStoreError("floating-point plan values are unsupported")
 
     try:
+        raw = selected.read_bytes()
         value = json.loads(
-            selected.read_text(encoding="utf-8"),
+            raw.decode("utf-8", errors="strict"),
             object_pairs_hook=reject_duplicates,
             parse_float=reject_float,
             parse_constant=reject_constant,
@@ -260,6 +261,8 @@ def load_plan(path: str | os.PathLike[str]) -> CohortPlan:
         plan = CohortPlan.from_manifest(value)
     except ValueError as error:
         raise PlanStoreError(str(error)) from error
+    if plan.to_bytes() != raw:
+        raise PlanStoreError("plan JSON is not canonical")
     briefing = load_briefing(selected)
     import hashlib
 
