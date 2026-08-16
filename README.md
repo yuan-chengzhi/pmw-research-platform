@@ -41,6 +41,10 @@ provider 计费器和完整持久 settlement。因此本仓库目前不宣称“
 平台已经完成”；未来 runtime 仍必须认证 plan 与 session，不能把调用方构造的
 `SessionSpec` 当作身份凭证。
 
+基础包可以独立安装；需要读写 PMW world 时，再暴露 source lock 指定的核心，
+或在有权读取该仓库的环境中安装 `.[pmw]`。公共 CI 不持有跨私有仓库凭证，
+因此只跳过依赖真实 PMW 的集成用例；精确 M03 连续性由本地锁定核心单独验证。
+
 ## 操作面
 
 ```bash

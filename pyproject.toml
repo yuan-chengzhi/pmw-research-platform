@@ -8,11 +8,12 @@ version = "0.1.0"
 description = "A small session runtime for persistent mathematical research worlds"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = [
-  "persistent-mathematical-worlds @ git+https://github.com/yuan-chengzhi/persistent-mathematical-worlds.git@4880f184c60bd34181302c5343ec0db95f154851"
-]
+dependencies = []
 
 [project.optional-dependencies]
+pmw = [
+  "persistent-mathematical-worlds @ git+https://github.com/yuan-chengzhi/persistent-mathematical-worlds.git@4880f184c60bd34181302c5343ec0db95f154851"
+]
 dev = ["pytest>=8"]
 
 [project.scripts]

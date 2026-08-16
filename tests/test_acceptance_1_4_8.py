@@ -3,6 +3,14 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+import pytest
+
+
+pytest.importorskip(
+    "pmw_r2.platform_admission",
+    reason="the exact PMW core is an optional integration dependency",
+)
+
 from pmw_r2.platform_admission import (
     ADMIT,
     GET,
