@@ -1,74 +1,117 @@
 # Architecture v0.1
 
-Status: implementation baseline
+Status: **model-free control plane implemented; real agent runtime pending**.
 
-## One world, replaceable sessions
-
-The canonical mathematical state is a linear, content-addressed PMW world.
-Every cohort freezes one base snapshot for orientation. Sessions may observe
-new records through an explicit delta view; the next cohort simply attaches to
-the then-current head. No predecessor wrapper or `M0i -> M0i+1` import exists.
-
-The platform uses a stable host capability to perform PMW admissions. The
-outer broker authenticates each session and embeds `cohort_id`, `session_id`,
-the base snapshot, parents, and provenance in every generic research record.
-The PMW core continues to enforce exact snapshots, visibility, idempotency,
-linear Git CAS, and independent audit.
-
-## Source authority
+## Authority boundaries
 
 | Concern | Authority |
 |---|---|
-| Problem statements and verifier contracts | `agent-math-frontier` |
-| Durable identity, provenance, admission and snapshots | `persistent-mathematical-worlds` |
-| Sessions, concurrency, runtime safety and receipts | this repository |
-| Historical M01–M03 evidence | archived source campaign and immutable run data |
+| Problem statements, formalization status and verifier contracts | `agent-math-frontier` |
+| Immutable records, provenance, admissions and snapshots | `persistent-mathematical-worlds` |
+| Cohort identity, briefing, artifact CAS, scheduling primitives and safety policy | this repository |
+| M01–M03 experiment evidence | archived frontier campaign |
 
-Dependencies are selected by repository URL and full commit in
-`config/core-lock.json`. Local paths are deployment details and never become
-the identity of a dependency.
+The packaged lock at `src/pmw_platform/locks/core-lock.json` binds the first two
+repositories by URL and full commit. It is a validated identity lock, not yet a
+source materializer; `source-cache/` remains future adapter work.
 
-## Generic record
+## Long-lived world
 
-A research record has a small typed envelope and a JSON payload. The envelope
-states its kind, authoring session, cohort, target IDs, parent admissions and
-base snapshot. Large artifacts are content-addressed separately and referenced
-from the payload. The platform does not attempt to force all mathematical
-thought into one ontology.
+The managed `math-frontier` world continues the exact settled M03 snapshot.
+There is no predecessor wrapper and no automatic `M0i → M0i+1` import. A
+cohort freezes one base snapshot for orientation; later cohorts attach to the
+then-current head.
 
-Initial kinds are `NOTE`, `NEED`, `ATTEMPT`, `RESULT`, `OBJECTION`, and
-`CHECKPOINT`. Legacy M03 records are exposed through a read-only compatibility
-view; they are never rewritten.
+The world adapter currently provides exact read, delta, get, audit and PMW
+admission. Immutable snapshot views are cached in a small bounded LRU. The PMW
+core still owns linear Git CAS, visibility, idempotency and audit semantics.
 
-## Scheduling
+## Mathematical situation
 
-`count` determines how many explicit session IDs are created. `concurrency`
-is a semaphore bound and may be smaller than `count`. Each session settles
-independently. A tool error or agent failure is local; other sessions continue.
-The cohort receipt summarizes individual receipts but is not mathematical
-authority.
+`build_mathematical_situation` produces the exact `briefing.json` used by a
+cohort:
 
-## Research-default safety
+- every target card is included in full;
+- every non-card admission appears once in a global record index as a bounded
+  mathematical projection, parent refs, content hash, artifact refs and exact
+  `world.get` retrieval key; problems join to it by admission ref;
+- omissions are explicitly marked; no projection is presented as the full
+  record or as truth ranking;
+- the whole file is bound to the plan by SHA-256 and the exact snapshot ref.
 
-The default policy has four layers:
+The settled M03 briefing is about 519 KiB for 14 problems and 174 admissions.
+A 16 MiB serialization guard catches a world that needs a reviewed checkpoint
+instead of silently truncating history.
 
-1. OS containment for credentials, sibling workspaces, network and signals.
-2. Coarse host guards for disk reserve, wall time, requests, context and cost.
-3. Bounded capture: large output is drained, counted, hashed, tailed and
-   optionally externalized; retained output never grows without bound.
-4. Evidence admission: malformed or oversized submissions are rejected as an
-   action, not retroactively treated as a failed research session.
+## Session and cohort identity
 
-Only containment drift, surviving leaked processes, hard provider/accounting
-limits, or real disk emergency are session-terminal. Large files, hardlinks,
-ordinary no-follow symlinks, build churn and retained-output truncation are
-metrics or action-local outcomes. The historical v9 behavior is named
-`strict-experiment` and stays available only for reproduction.
+A plan stores common launch identity once and only varying session IDs per
+entry. It freezes:
+
+```text
+world_id + world_ref + base_snapshot_ref
+safety_profile + safety_profile_sha256
+core_lock_sha256 + briefing_sha256
+explicit session IDs + concurrency
+```
+
+`count` is only a construction convenience. The persisted session list is the
+authority. One cohort supports 1–4096 sessions; a fixed worker pool limits
+active callables to `concurrency`, so memory use does not grow by creating N
+tasks up front. Receipts carry the full plan identity. This scheduler has been
+tested with deterministic callables, not real agent processes.
+
+## Trusted publish boundary
+
+The intended agent-facing proposal is a `ResearchContribution`: mathematical content,
+parents and artifact refs, with no identity fields. The trusted host binds it
+to a frozen `SessionSpec` and constructs the durable `ResearchRecord`.
+
+The low-level PMW writer is private to `ResearchWorld`; callers receive a
+`BoundResearchSession`. Binding checks world ID/ref and base snapshot.
+Publishing checks parents and requires every referenced artifact to resolve in
+the global CAS. A future process/tool server must preserve this boundary and
+must never hand the PMW host capability to an agent. The current model-free API
+does not authenticate a caller-created `SessionSpec`; real runtime work must
+authenticate it against the saved plan before exposing this bound surface.
+
+## Artifact ownership
+
+Large evidence is stored under:
+
+```text
+pmw-research-data/objects/
+├── sha256/<artifact digest>
+├── artifact-receipts/sha256/<receipt digest>.json
+└── imports/<validated import manifest>.json
+```
+
+Imports use exact-byte copies, no-follow reads, atomic publication and
+byte-identical deduplication. They intentionally do not symlink or hardlink to
+retirable campaign directories. Hardlinked *source files* are accepted as
+ordinary files and copied; hardlinks are not treated as research misconduct.
+
+## Safety: policy now, enforcement later
+
+Implemented primitives are a validated policy map and a bounded output
+accumulator that drains, counts, hashes and tails data without retaining it
+unboundedly. They do not themselves spawn, scan or kill processes.
+
+The future process adapter must apply these scopes exactly:
+
+- `SESSION_STOP`: real containment drift, unclean process leakage, accounting
+  corruption, session wall limit, runtime/root drift or disk emergency;
+- `JOB_STOP`: one command/request limit or denied boundary action;
+- `REJECT`: one invalid artifact, read or PMW proposal;
+- `WARN`: observations such as ordinary hardlinks, large files and build churn.
+
+`research-default` has no single-file ceiling and no live full-tree scan.
+`strict-experiment` preserves v9-era behavior only for historical replay.
 
 ## Deliberate non-goals for v0.1
 
-- no real model calls or OAuth canary;
-- no new M04/M05 treatment;
-- no ballot or all-agent barrier;
-- no copy of the old campaign launcher;
-- no claim that a verifier PASS is a novelty or final mathematical result.
+- no `session start`, agent subprocess, Pi/OpenAI request or OAuth canary;
+- no claim that policy parsing equals OS containment;
+- no provider usage/cost accounting or final durable settlement implementation;
+- no new M04/M05 treatment, ballot or all-agent barrier;
+- no claim that a verifier PASS proves novelty or solves an open problem.

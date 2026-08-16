@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -50,3 +51,37 @@ def test_registry_rejects_implicit_replace_and_symlink(tmp_path: Path) -> None:
     real.symlink_to(moved)
     with pytest.raises(ConfigError, match="symlink"):
         registry.list()
+
+
+def test_registry_serializes_concurrent_adds(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    repos = [tmp_path / "one.git", tmp_path / "two.git"]
+    for repo in repos:
+        repo.mkdir()
+    rows = [
+        WorldRegistration.create(
+            name=name,
+            repo=repo,
+            world_ref="refs/pmw/world",
+            seed_snapshot_ref=SNAPSHOT,
+        )
+        for name, repo in zip(("one", "two"), repos, strict=True)
+    ]
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(WorldRegistry(data).add, rows))
+
+    assert [row.name for row in WorldRegistry(data).list()] == ["one", "two"]
+
+
+def test_registry_rejects_duplicate_and_oversized_json(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    data.mkdir()
+    path = data / "registry.json"
+    path.write_text('{"schema":"x","schema":"y","worlds":[]}')
+    with pytest.raises(ConfigError, match="duplicate registry key"):
+        WorldRegistry(data).list()
+
+    path.write_bytes(b" " * 1_048_577)
+    with pytest.raises(ConfigError, match="bounded regular file"):
+        WorldRegistry(data).list()

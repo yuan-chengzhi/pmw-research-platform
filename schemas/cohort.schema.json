@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/yuan-chengzhi/pmw-research-platform/schemas/cohort.schema.json",
+  "title": "PMW research cohort plan",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "cohort_id",
+    "world_id",
+    "world_ref",
+    "base_snapshot_ref",
+    "safety_profile",
+    "safety_profile_sha256",
+    "core_lock_sha256",
+    "briefing_sha256",
+    "concurrency",
+    "sessions"
+  ],
+  "properties": {
+    "schema": {"const": "PMW_COHORT_PLAN_1"},
+    "cohort_id": {"$ref": "#/$defs/id"},
+    "world_id": {"$ref": "#/$defs/id"},
+    "world_ref": {"$ref": "#/$defs/worldRef"},
+    "base_snapshot_ref": {"$ref": "#/$defs/snapshot"},
+    "safety_profile": {"$ref": "#/$defs/id"},
+    "safety_profile_sha256": {"$ref": "#/$defs/sha256"},
+    "core_lock_sha256": {"$ref": "#/$defs/sha256"},
+    "briefing_sha256": {"$ref": "#/$defs/sha256"},
+    "concurrency": {"type": "integer", "minimum": 1, "maximum": 4096},
+    "sessions": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 4096,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["session_id"],
+        "properties": {
+          "session_id": {"$ref": "#/$defs/id"}
+        }
+      }
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "snapshot": {
+      "type": "string",
+      "pattern": "^snapshot/sha256/[0-9a-f]{64}$"
+    },
+    "worldRef": {
+      "type": "string",
+      "pattern": "^refs/pmw/[A-Za-z0-9][A-Za-z0-9._/-]{0,240}$"
+    }
+  }
+}

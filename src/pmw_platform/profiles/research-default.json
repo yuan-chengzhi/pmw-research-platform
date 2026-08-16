@@ -1,0 +1,78 @@
+{
+  "schema": "PMW_RESEARCH_SAFETY_PROFILE_1",
+  "name": "research-default",
+  "dispositions": {
+    "ARTIFACT_INVALID": "REJECT",
+    "ARTIFACT_TOO_LARGE": "REJECT",
+    "CONTEXT_HARD_LIMIT": "JOB_STOP",
+    "CREDENTIAL_BOUNDARY_VIOLATION": "JOB_STOP",
+    "CROSS_SESSION_BOUNDARY_VIOLATION": "JOB_STOP",
+    "DISK_RESERVE_BREACHED": "SESSION_STOP",
+    "NETWORK_BOUNDARY_VIOLATION": "JOB_STOP",
+    "OBSERVED_OUTPUT_SAFETY_CAP": "JOB_STOP",
+    "OUTPUT_READ_INVALID": "REJECT",
+    "OUTPUT_TRUNCATED": "WARN",
+    "PMW_AUTHORITY_VIOLATION": "REJECT",
+    "PROCESS_GROUP_CLEANUP_FAILED": "SESSION_STOP",
+    "PROVIDER_ACCOUNTING_INVALID": "SESSION_STOP",
+    "PROVIDER_REQUEST_BUDGET_EXCEEDED": "JOB_STOP",
+    "RUNTIME_ARTIFACT_DRIFT": "SESSION_STOP",
+    "RUNTIME_CACHE_CHURN": "WARN",
+    "RUNTIME_CACHE_ENTRY_LIMIT_EXCEEDED": "JOB_STOP",
+    "RUNTIME_CACHE_FILE_SIZE_EXCEEDED": "WARN",
+    "RUNTIME_CACHE_MOUNT_BOUNDARY": "SESSION_STOP",
+    "RUNTIME_CACHE_ROOT_DRIFT": "SESSION_STOP",
+    "RUNTIME_CACHE_SPECIAL_FILE_REJECTED": "WARN",
+    "RUNTIME_CACHE_TOTAL_BYTES_EXCEEDED": "JOB_STOP",
+    "SANDBOX_CONTAINMENT_DRIFT": "SESSION_STOP",
+    "SESSION_WALL_LIMIT": "SESSION_STOP",
+    "TOOL_CANCELLED": "JOB_STOP",
+    "TOOL_SPAWN_FAILED": "JOB_STOP",
+    "TOOL_TIMEOUT": "JOB_STOP",
+    "VERIFIER_OUTPUT_TOO_LARGE": "REJECT",
+    "WORKSPACE_DEPTH_LIMIT_EXCEEDED": "JOB_STOP",
+    "WORKSPACE_ENTRY_LIMIT_EXCEEDED": "JOB_STOP",
+    "WORKSPACE_FILE_SIZE_EXCEEDED": "WARN",
+    "WORKSPACE_HARDLINK_OBSERVED": "WARN",
+    "WORKSPACE_LIVE_CHURN": "WARN",
+    "WORKSPACE_MOUNT_BOUNDARY": "SESSION_STOP",
+    "WORKSPACE_QUIESCENT_SCAN_FAILED": "JOB_STOP",
+    "WORKSPACE_ROOT_DRIFT": "SESSION_STOP",
+    "WORKSPACE_SPECIAL_FILE_REJECTED": "WARN",
+    "WORKSPACE_TOTAL_BYTES_EXCEEDED": "JOB_STOP",
+    "WORKSPACE_UNSAFE_SYMLINK": "WARN"
+  },
+  "disk_guard": {
+    "reserve_bytes": 21474836480,
+    "reserve_fraction": 0.1,
+    "poll_interval_seconds": 5.0
+  },
+  "workspace": {
+    "maximum_total_bytes": 8589934592,
+    "maximum_entries": 500000,
+    "maximum_file_bytes": null,
+    "maximum_depth": 512,
+    "scan_mode": "QUIESCENT",
+    "live_scan_interval_seconds": null
+  },
+  "runtime_cache": {
+    "maximum_total_bytes": 4294967296,
+    "maximum_entries": 500000,
+    "maximum_file_bytes": null,
+    "maximum_depth": 512,
+    "scan_mode": "QUIESCENT",
+    "live_scan_interval_seconds": null
+  },
+  "captures": {
+    "bash": {
+      "maximum_retained_bytes": 1048576,
+      "maximum_observed_bytes": 1073741824,
+      "tail_bytes": 4096
+    },
+    "long_job": {
+      "maximum_retained_bytes": 67108864,
+      "maximum_observed_bytes": 4294967296,
+      "tail_bytes": 16384
+    }
+  }
+}

@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/yuan-chengzhi/pmw-research-platform/schemas/research-record.schema.json",
+  "title": "PMW generic research record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "world_id",
+    "cohort_id",
+    "session_id",
+    "base_snapshot_ref",
+    "kind",
+    "problem_ids",
+    "parent_refs",
+    "title",
+    "body",
+    "artifact_refs",
+    "payload"
+  ],
+  "properties": {
+    "schema": {"const": "PMW_RESEARCH_RECORD_1"},
+    "world_id": {"$ref": "#/$defs/id"},
+    "cohort_id": {"$ref": "#/$defs/id"},
+    "session_id": {"$ref": "#/$defs/id"},
+    "base_snapshot_ref": {"$ref": "#/$defs/snapshot"},
+    "kind": {
+      "enum": ["NOTE", "NEED", "ATTEMPT", "RESULT", "OBJECTION", "CHECKPOINT"]
+    },
+    "problem_ids": {
+      "type": "array",
+      "maxItems": 64,
+      "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$"}
+    },
+    "parent_refs": {
+      "type": "array",
+      "maxItems": 16,
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/admission"}
+    },
+    "title": {"type": "string", "minLength": 1},
+    "body": {"type": "string", "minLength": 1},
+    "artifact_refs": {
+      "type": "array",
+      "maxItems": 64,
+      "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^artifact/sha256/[0-9a-f]{64}$"}
+    },
+    "payload": {"type": "object"}
+  },
+  "$defs": {
+    "id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"},
+    "snapshot": {"type": "string", "pattern": "^snapshot/sha256/[0-9a-f]{64}$"},
+    "admission": {"type": "string", "pattern": "^admission/sha256/[0-9a-f]{64}$"}
+  }
+}
