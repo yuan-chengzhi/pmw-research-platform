@@ -558,6 +558,29 @@ def test_stop_joins_completion_even_when_provider_emits_no_more_events(
     assert pending == []
 
 
+def test_linux_kernel_ps_rows_do_not_break_descendant_discovery() -> None:
+    snapshot = b"""\
+2 0 0
+100 1 100
+101 100 100
+102 101 102
+"""
+
+    assert pi_runtime._descendant_groups_from_ps(
+        snapshot,
+        root_pid=100,
+        root_group=100,
+    ) == (102,)
+
+    with pytest.raises(pi_runtime.PiRpcFailure) as raised:
+        pi_runtime._descendant_groups_from_ps(
+            b"100 1 100\n103 100 0\n",
+            root_pid=100,
+            root_group=100,
+        )
+    assert raised.value.code == "PROCESS_GROUP_IDENTITY_FAILURE"
+
+
 def test_descendant_discovery_failure_can_never_claim_stopped(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

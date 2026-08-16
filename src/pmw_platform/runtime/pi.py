@@ -1597,6 +1597,27 @@ async def _discover_descendant_groups(
     assert process is not None
     if process.returncode != 0 or len(stdout) > 16 * 1024 * 1024:
         raise PiRpcFailure("PROCESS_GROUP_DISCOVERY_FAILED")
+    return _descendant_groups_from_ps(
+        stdout,
+        root_pid=root_pid,
+        root_group=root_group,
+    )
+
+
+def _descendant_groups_from_ps(
+    stdout: bytes,
+    *,
+    root_pid: int,
+    root_group: int,
+) -> tuple[int, ...]:
+    """Parse one bounded POSIX ``ps`` snapshot.
+
+    Linux exposes kernel processes whose PGID is zero in an all-process
+    snapshot.  Those unrelated rows are valid input and must not turn every
+    cooperative Pi cleanup into an unproven stop.  A zero/nonpositive group is
+    still rejected if it is actually reachable from the managed root.
+    """
+
     children: dict[int, list[tuple[int, int]]] = {}
     try:
         for raw in stdout.decode("ascii", errors="strict").splitlines():
@@ -1604,7 +1625,7 @@ async def _discover_descendant_groups(
             if len(fields) != 3:
                 raise ValueError("malformed ps row")
             pid, parent, group = map(int, fields)
-            if pid <= 0 or parent < 0 or group <= 0:
+            if pid <= 0 or parent < 0 or group < 0:
                 raise ValueError("invalid process identity")
             children.setdefault(parent, []).append((pid, group))
     except (UnicodeError, ValueError) as error:
@@ -1619,6 +1640,8 @@ async def _discover_descendant_groups(
                 continue
             seen.add(pid)
             pending.append(pid)
+            if group <= 0:
+                raise PiRpcFailure("PROCESS_GROUP_IDENTITY_FAILURE")
             if group != root_group:
                 groups.add(group)
     if os.getpgrp() in groups:
