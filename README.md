@@ -31,7 +31,9 @@
 | 共同数学状态 | 每个 cohort 冻结同一 snapshot 与完整 briefing；operator 可 `status/get/delta` | 运行中 agent-facing 的 PMW `search/get/updates_since` |
 | 多 agent 执行 | 任意 session 数、固定并发、独立 workspace/cache/evidence、统一 settlement | 运行中 ballot/barrier、路线抢占与 peer-update 通知 |
 | PMW 写回 | 成功停止后由 trusted host 绑定身份并写回 | 同一 cohort 其他在途 agent 对新写回的实时可见性 |
-| Verifier | 已结算 candidate 的 host-authoritative 复验与不可变 receipt | agent-facing live verifier、实时 `verifier_feedback` |
+| Verifier | 已结算 candidate 的 host-authoritative 复验与不可变 receipt；每个 session workspace 物化只读 pinned kit（`.pmw-verifier-kit/bin/amf-verify`），会话内可自行调用，判决显式 `ADVISORY_IN_SESSION_VERIFICATION`，调用计数入 receipt（host 观测、非防篡改） | 具有结算权威的实时 `verifier_feedback`；会话内判决与结算判决之间的字节 pin |
+| Usage 计量 | receipt 必带 typed usage block，三态自述：`MEASURED`（provenance + 逐请求记录 + 聚合读数）/`ASSERTED`（被标注的 profile 断言）/`UNMEASURED`；Pi adapter 逐条转录 `message_end`/`compaction_end`/`get_session_stats` | 货币成本权威账本、跨 cohort usage 汇总、与 provider 计费单对账；任何把「未报告」补成 0 的推断 |
+| Agenda treatment | 三臂 record schema 与纯校验器（experiments plugin，可独立调用）：D 臂独占租约 + TTL、C 臂 coordinator directive 与引用规则、自适应 hardening trigger（settled 分解触发，非单调性已文档化） | treatment 的 runtime 接线：无 arm 编排、无 host 自动拒绝、verdict 不入 receipt/settlement |
 | Artifact | SHA-256 CAS、引用闭包与结算后 candidate capture | live `submit_artifact`/验证反馈工具 |
 | Bash/output | Pi 内置 `bash` 可由操作者显式开启；transport frame/stderr evidence 有界 | tool-result → model 的 bounded-output projection 与 `output_read` |
 | Context | backend window、cohort 默认值或逐 session 覆盖 | 把 context override 与任意外部 extension 安全组合的通用证明 |
