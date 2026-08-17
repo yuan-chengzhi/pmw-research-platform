@@ -39,6 +39,10 @@ from .contracts import (
 )
 from .context import ContextWindowControl
 from .safety import BoundedCaptureAccumulator, CaptureLimits, CaptureSnapshot
+from .usage import (
+    PROVENANCE_COMMAND_BACKEND_MODEL_FREE_PROFILE,
+    UsageEvidence,
+)
 from ..world.records import canonical_json
 
 
@@ -68,6 +72,30 @@ _CAPTURE_FIELDS = {
     "maximum_observed_bytes",
     "tail_bytes",
 }
+
+
+def _model_free_assertion() -> UsageEvidence:
+    """State the model-free profile as a claim, never as a measurement.
+
+    This adapter opens no provider transport and inherits no credential into
+    the child, so it issues no model call of its own.  That is a property of
+    the profile, not a reading: cooperative process-group containment is not a
+    sandbox, and no surface here observes what the child itself does.  The
+    zero is therefore labeled ``ASSERTED`` so a receipt reader can never
+    mistake it for metered usage.
+    """
+
+    return UsageEvidence.asserted(
+        provenance=PROVENANCE_COMMAND_BACKEND_MODEL_FREE_PROFILE,
+        assertion={"adapter_model_calls": 0, "adapter_provider_requests": 0},
+        detail=(
+            "asserted from the model-free command backend profile: the "
+            "adapter opens no provider transport and passes no credential to "
+            "the child. Not a measurement -- cooperative process-group "
+            "containment is not a sandbox and the child's own token usage is "
+            "observed by no surface this adapter reads."
+        ),
+    )
 
 
 class CommandBackendError(ValueError):
@@ -936,6 +964,7 @@ class _RunningCommandSession:
                         "captures": captures,
                     }
                 },
+                usage_evidence=_model_free_assertion(),
             )
 
     async def _run(self) -> BackendOutcome:
@@ -1057,6 +1086,7 @@ class _RunningCommandSession:
                 contributions=reported.contributions,
                 usage=reported.usage,
                 evidence=reported_evidence,
+                usage_evidence=_model_free_assertion(),
             )
         except (CommandBackendError, RuntimeContractError, ValueError) as error:
             return self._failure(
@@ -1130,6 +1160,7 @@ class _RunningCommandSession:
             terminal_reason=reason,
             summary=summary,
             evidence={"command_runtime": runtime_evidence},
+            usage_evidence=_model_free_assertion(),
         )
 
 

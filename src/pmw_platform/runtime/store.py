@@ -37,6 +37,7 @@ from .context import (
     ContextWindowControl,
     ContextWindowPolicy,
 )
+from .usage import usage_evidence_value_is_valid
 
 
 RUNTIME_LAUNCH_SCHEMA = "PMW_RUNTIME_LAUNCH_1"
@@ -98,6 +99,7 @@ _RECEIPT_FIELDS = frozenset({
     "publications",
     "error",
     "resource_guard",
+    "usage",
     "context_window",
 })
 _STOP_PROOF_FIELDS = frozenset({
@@ -1193,6 +1195,10 @@ class RuntimeStore:
         _validate_resource_guard(
             value.get("resource_guard"), session_id=session_id
         )
+        # A durable receipt must never hold a token count whose epistemic
+        # status is unstated, so the usage block is structurally required.
+        if not usage_evidence_value_is_valid(value.get("usage")):
+            _fail("MALFORMED_SESSION_RECEIPT", f"usage {session_id}")
         context_window = value.get("context_window")
         launch_context = launch.get("context_window_policy")
         effective_tokens: object = None

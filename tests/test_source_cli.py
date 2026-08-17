@@ -85,5 +85,8 @@ def test_source_commands_route_exact_data_root_without_network(
             "tree_path": str(result.tree_path),
             "manifest_path": str(result.manifest_path),
             "network_calls": 0,
+            "network_calls_authority": (
+                "HOST_ASSERTION_GIT_PROTOCOL_ALLOW_NEVER"
+            ),
         }
     ]

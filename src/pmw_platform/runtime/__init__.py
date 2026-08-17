@@ -63,6 +63,14 @@ from .store import (
     RuntimeStoreError,
     SessionPaths,
 )
+from .usage import (
+    USAGE_EVIDENCE_SCHEMA,
+    UsageEvidence,
+    UsageEvidenceError,
+    UsageRequestRecord,
+    UsageState,
+    UsageTotals,
+)
 
 __all__ = [
     "BackendIdentity",
@@ -102,6 +110,12 @@ __all__ = [
     "SessionPaths",
     "SessionRequest",
     "StopProof",
+    "USAGE_EVIDENCE_SCHEMA",
+    "UsageEvidence",
+    "UsageEvidenceError",
+    "UsageRequestRecord",
+    "UsageState",
+    "UsageTotals",
     "authenticate_plan_bundle",
     "build_launch_manifest",
     "load_command_backend",

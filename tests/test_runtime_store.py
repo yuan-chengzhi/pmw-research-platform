@@ -18,6 +18,7 @@ from pmw_platform.runtime.store import (
     RuntimeStore,
     RuntimeStoreError,
 )
+from pmw_platform.runtime.usage import UsageEvidence
 from pmw_platform.world.records import canonical_json
 
 
@@ -134,6 +135,10 @@ def _receipt(
             "terminal_event": None,
             "warnings": [],
         },
+        "usage": UsageEvidence.unmeasured(
+            provenance="NO_BACKEND_OUTCOME",
+            detail="test receipt",
+        ).to_value(),
         "context_window": {
             "semantics": (
                 "ACTIVE_MODEL_CONTEXT_WINDOW_TOKENS_NOT_CUMULATIVE_SESSION_USAGE"

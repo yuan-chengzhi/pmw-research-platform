@@ -46,6 +46,7 @@ from .readiness import (
 )
 from .resource_guard import ResourceEvent, ResourceGuard
 from .store import RuntimeClaim, RuntimeStore, RuntimeStoreError
+from .usage import PROVENANCE_NO_BACKEND_OUTCOME, UsageEvidence
 
 
 RUNTIME_LAUNCH_SCHEMA = "PMW_RUNTIME_LAUNCH_1"
@@ -479,6 +480,18 @@ class _Controller:
                 }
             ),
             "resource_guard": self.resource_guard.evidence(spec.session_id),
+            # A receipt always states its usage epistemics: measured with a
+            # named provenance, asserted by a profile, or explicitly
+            # unmeasured.  A session that never produced an outcome measured
+            # nothing, and says exactly that.
+            "usage": (
+                UsageEvidence.unmeasured(
+                    provenance=PROVENANCE_NO_BACKEND_OUTCOME,
+                    detail="no backend outcome was produced for this session",
+                ).to_value()
+                if outcome is None
+                else outcome.usage_evidence.to_value()
+            ),
             "context_window": {
                 "semantics": CONTEXT_WINDOW_SEMANTICS,
                 "configured_tokens": self.context_policy.for_session(

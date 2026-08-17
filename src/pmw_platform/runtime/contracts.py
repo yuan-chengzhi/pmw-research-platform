@@ -22,6 +22,10 @@ from .context import (
     MAXIMUM_CONTEXT_WINDOW_TOKENS,
     ContextWindowControl,
 )
+from .usage import (
+    PROVENANCE_BACKEND_DECLARED_NO_USAGE_EVIDENCE,
+    UsageEvidence,
+)
 
 
 BACKEND_OUTCOME_SCHEMA = "PMW_RUNTIME_BACKEND_OUTCOME_1"
@@ -252,12 +256,20 @@ class StopProof:
 
 @dataclass(frozen=True, init=False)
 class BackendOutcome:
-    """A bounded backend report; the host still decides terminal status."""
+    """A bounded backend report; the host still decides terminal status.
+
+    ``usage`` stays free-form because the session's own result envelope writes
+    it, and nothing in that envelope is trusted as a measurement.
+    ``usage_evidence`` is the opposite: only trusted adapter code sets it, it
+    never travels through :meth:`from_value`, and it always states whether its
+    numbers were measured, merely asserted, or absent.
+    """
 
     success: bool
     terminal_reason: str
     summary: str
     contributions: tuple[ResearchContribution, ...]
+    usage_evidence: UsageEvidence
     _usage_bytes: bytes = field(repr=False)
     _evidence_bytes: bytes = field(repr=False)
 
@@ -270,6 +282,7 @@ class BackendOutcome:
         contributions: tuple[ResearchContribution, ...] = (),
         usage: Mapping[str, object] | None = None,
         evidence: Mapping[str, object] | None = None,
+        usage_evidence: UsageEvidence | None = None,
     ) -> None:
         if type(success) is not bool:
             raise RuntimeContractError("MALFORMED_BACKEND_OUTCOME", "success")
@@ -294,6 +307,23 @@ class BackendOutcome:
         selected_evidence = {} if evidence is None else evidence
         if type(selected_usage) is not dict or type(selected_evidence) is not dict:
             raise RuntimeContractError("MALFORMED_BACKEND_OUTCOME", "metadata")
+        # An outcome that says nothing about tokens has measured nothing.  The
+        # default is the honest marker, never an implied zero.
+        selected_usage_evidence = (
+            UsageEvidence.unmeasured(
+                provenance=PROVENANCE_BACKEND_DECLARED_NO_USAGE_EVIDENCE,
+                detail=(
+                    "the backend reported no typed usage evidence for this "
+                    "outcome"
+                ),
+            )
+            if usage_evidence is None
+            else usage_evidence
+        )
+        if not isinstance(selected_usage_evidence, UsageEvidence):
+            raise RuntimeContractError(
+                "MALFORMED_BACKEND_OUTCOME", "usage_evidence"
+            )
         usage_clone = _json_clone(
             selected_usage,
             maximum_bytes=MAXIMUM_BACKEND_METADATA_BYTES,
@@ -308,6 +338,7 @@ class BackendOutcome:
         object.__setattr__(self, "terminal_reason", terminal_reason)
         object.__setattr__(self, "summary", summary)
         object.__setattr__(self, "contributions", contributions)
+        object.__setattr__(self, "usage_evidence", selected_usage_evidence)
         object.__setattr__(self, "_usage_bytes", canonical_json(usage_clone))
         object.__setattr__(self, "_evidence_bytes", canonical_json(evidence_clone))
 
@@ -338,7 +369,13 @@ class BackendOutcome:
 
     @classmethod
     def from_value(cls, value: object) -> "BackendOutcome":
-        """Validate the bounded identity-free result written by a backend."""
+        """Validate the bounded identity-free result written by a backend.
+
+        The envelope schema deliberately has no ``usage_evidence`` field: a
+        session must not be able to write its own token measurement into a
+        receipt.  Every outcome parsed here starts ``UNMEASURED``, and only the
+        trusted adapter that watched the transport may attach a measured block.
+        """
 
         expected = {
             "schema",

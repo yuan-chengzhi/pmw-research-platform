@@ -44,6 +44,17 @@ from .contracts import (
     StopProof,
 )
 from .context import ContextWindowControl, ContextWindowPolicy
+from .usage import (
+    BASIS_RUNTIME_REPORTED_SESSION_TOTALS,
+    MAXIMUM_USAGE_REQUEST_RECORDS,
+    PROVENANCE_PI_RPC_REPORTED,
+    PROVENANCE_PI_RPC_SURFACE_SILENT,
+    UsageEvidence,
+    UsageRequestRecord,
+    UsageTotals,
+    observed_count as _observed_count,
+    summed_totals as _summed_totals,
+)
 from ..world.records import canonical_json
 
 
@@ -1904,6 +1915,165 @@ def _parse_result(raw: bytes) -> BackendOutcome:
         raise PiBackendError("PI_RESULT_INVALID", "backend outcome") from error
 
 
+class _PiUsageCollector:
+    """Read Pi's reported token usage off the frames it actually emits.
+
+    Pi reports a ``usage`` object on every completed message and on a
+    completed compaction, and it answers ``get_session_stats`` with runtime
+    totals.  This collector transcribes those numbers and nothing else: a
+    field Pi omits stays omitted, and a session where Pi reported no usage at
+    all yields ``UNMEASURED`` rather than a fabricated zero.
+    """
+
+    def __init__(self) -> None:
+        self.records: list[UsageRequestRecord] = []
+        self.observed_records = 0
+        self.truncated = False
+        self.session_totals: UsageTotals | None = None
+        self.context_tokens: int | None = None
+        self.context_window_tokens: int | None = None
+
+    def observe_message(self, message: object) -> None:
+        """Record one completed message when Pi reported its usage."""
+
+        if type(message) is not dict:
+            return
+        # Metering must never be the thing that fails a session: a role Pi
+        # spells oddly is recorded as unknown, not raised.
+        role = _short_label(message.get("role"))
+        self._append(
+            usage=message.get("usage"),
+            source_event="message_end",
+            role="unknown" if role is None else role,
+            provider=message.get("provider"),
+            model=message.get("model"),
+            stop_reason=message.get("stopReason"),
+        )
+
+    def observe_compaction(self, frame: Mapping[str, object]) -> None:
+        """Record the summarization request a compaction paid for."""
+
+        result = frame.get("result")
+        if type(result) is not dict:
+            return
+        self._append(
+            usage=result.get("usage"),
+            source_event="compaction_end",
+            role="compaction",
+            provider=None,
+            model=None,
+            stop_reason=None,
+        )
+
+    def _append(
+        self,
+        *,
+        usage: object,
+        source_event: str,
+        role: str,
+        provider: object,
+        model: object,
+        stop_reason: object,
+    ) -> None:
+        if type(usage) is not dict:
+            return
+        counts = {
+            "input_tokens": _observed_count(usage.get("input")),
+            "cached_input_tokens": _observed_count(usage.get("cacheRead")),
+            "cache_write_tokens": _observed_count(usage.get("cacheWrite")),
+            "output_tokens": _observed_count(usage.get("output")),
+            "reasoning_tokens": _observed_count(usage.get("reasoning")),
+            "total_tokens": _observed_count(usage.get("totalTokens")),
+        }
+        if all(value is None for value in counts.values()):
+            return
+        self.observed_records += 1
+        if len(self.records) >= MAXIMUM_USAGE_REQUEST_RECORDS:
+            # Keep the aggregate honest by continuing to count the request
+            # even once the per-request list is capped.
+            self.truncated = True
+            return
+        self.records.append(
+            UsageRequestRecord(
+                ordinal=len(self.records) + 1,
+                source_event=source_event,
+                role=role,
+                provider=_short_label(provider),
+                model=_short_label(model),
+                stop_reason=_short_label(stop_reason),
+                **counts,
+            )
+        )
+
+    def observe_session_stats(
+        self,
+        stats: Mapping[str, object],
+        *,
+        fallback_context_window_tokens: int | None = None,
+    ) -> None:
+        """Transcribe the runtime's own session-wide totals and context read."""
+
+        tokens = stats.get("tokens")
+        if type(tokens) is dict:
+            totals = UsageTotals(
+                basis=BASIS_RUNTIME_REPORTED_SESSION_TOTALS,
+                request_count=None,
+                input_tokens=_observed_count(tokens.get("input")),
+                cached_input_tokens=_observed_count(tokens.get("cacheRead")),
+                cache_write_tokens=_observed_count(tokens.get("cacheWrite")),
+                output_tokens=_observed_count(tokens.get("output")),
+                reasoning_tokens=None,
+                total_tokens=_observed_count(tokens.get("total")),
+            )
+            if totals.reported_any_count:
+                self.session_totals = totals
+        context = stats.get("contextUsage")
+        if type(context) is dict:
+            self.context_tokens = _observed_count(context.get("tokens"))
+            self.context_window_tokens = _observed_count(
+                context.get("contextWindow")
+            )
+        if self.context_window_tokens is None:
+            self.context_window_tokens = _observed_count(
+                fallback_context_window_tokens
+            )
+
+    def evidence(self) -> UsageEvidence:
+        """Return the block this session earned, measured or not."""
+
+        totals: list[UsageTotals] = []
+        if self.records:
+            totals.append(_summed_totals(self.records))
+        if self.session_totals is not None:
+            totals.append(self.session_totals)
+        if not totals:
+            return UsageEvidence.unmeasured(
+                provenance=PROVENANCE_PI_RPC_SURFACE_SILENT,
+                detail=(
+                    "Pi emitted no message, compaction, or session-stats "
+                    "usage for this session"
+                ),
+            )
+        return UsageEvidence.measured(
+            provenance=PROVENANCE_PI_RPC_REPORTED,
+            requests=tuple(self.records),
+            requests_truncated=self.truncated,
+            totals=tuple(totals),
+            provider_reported_context_tokens=self.context_tokens,
+            provider_reported_context_window_tokens=self.context_window_tokens,
+            detail=(
+                "transcribed from Pi RPC message_end/compaction_end frames "
+                "and get_session_stats"
+            ),
+        )
+
+
+def _short_label(value: object) -> str | None:
+    if type(value) is not str or not value or len(value) > 512:
+        return None
+    return value if _MODEL.fullmatch(value) is not None else None
+
+
 class _RunningPiSession:
     def __init__(
         self,
@@ -1921,6 +2091,7 @@ class _RunningPiSession:
         self.prompt = prompt
         self.prompt_evidence = prompt_evidence
         self.result_path = result_path
+        self.usage = _PiUsageCollector()
         self.stop_requested = asyncio.Event()
         self.stop_reason: str | None = None
         self.completion = asyncio.create_task(
@@ -2037,10 +2208,16 @@ class _RunningPiSession:
                 retry_events += 1
             elif event_type in {"compaction_start", "compaction_end"}:
                 compaction_events += 1
+                if event_type == "compaction_end":
+                    self.usage.observe_compaction(frame)
             elif event_type == "extension_error":
                 raise PiRpcFailure("PI_EXTENSION_ERROR")
             elif event_type == "message_end":
                 message = frame.get("message")
+                # Every completed message is metered, including the tool-call
+                # turns that carry no final text.  Metering the last text
+                # message alone would hide most of a session's real cost.
+                self.usage.observe_message(message)
                 failure = _provider_failure(message)
                 if failure is not None:
                     raise failure
@@ -2069,6 +2246,10 @@ class _RunningPiSession:
             raise PiRpcFailure("RUNTIME_CONTEXT_REPORT_DRIFT")
         session_stats = _response_data(
             await self.transport.call("get_session_stats"), "get_session_stats"
+        )
+        self.usage.observe_session_stats(
+            session_stats,
+            fallback_context_window_tokens=context_window,
         )
 
         raw_result = _result_file(
@@ -2127,6 +2308,7 @@ class _RunningPiSession:
         )
         runtime["observed_pi_retry_events"] = retry_events
         runtime["observed_pi_compaction_events"] = compaction_events
+        runtime["observed_pi_usage_reports"] = self.usage.observed_records
         runtime["result_source"] = result_source
         runtime["result_sha256"] = hashlib.sha256(raw_result).hexdigest()
 
@@ -2160,6 +2342,7 @@ class _RunningPiSession:
             contributions=reported.contributions,
             usage=usage,
             evidence=evidence,
+            usage_evidence=self.usage.evidence(),
         )
 
     def _runtime_evidence(self, proof: StopProof) -> dict[str, object]:
@@ -2173,6 +2356,9 @@ class _RunningPiSession:
         summary: str,
         proof: StopProof,
     ) -> BackendOutcome:
+        # A session that failed part-way still spent whatever tokens Pi had
+        # already reported.  Carry that reading into the failure receipt
+        # instead of losing the cost of the attempt.
         return BackendOutcome(
             success=False,
             terminal_reason=(
@@ -2180,6 +2366,7 @@ class _RunningPiSession:
             ),
             summary=summary,
             evidence={"pi_rpc": self._runtime_evidence(proof)},
+            usage_evidence=self.usage.evidence(),
         )
 
 

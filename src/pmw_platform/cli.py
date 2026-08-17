@@ -365,7 +365,12 @@ def _session_plan(args: argparse.Namespace) -> None:
         "plan_path": str(path),
         "plan_sha256": plan_sha256(plan),
         "cohort": plan.to_manifest(),
+        # An assertion about this code path, not a metered reading: planning
+        # is deterministic host code and opens no provider transport.
         "model_calls": 0,
+        "model_calls_authority": (
+            "HOST_ASSERTION_NO_PROVIDER_TRANSPORT_IN_THIS_PATH"
+        ),
     })
 
 
@@ -611,7 +616,10 @@ def _source_result(
         "total_bytes": result.total_bytes,
         "tree_path": str(result.tree_path),
         "manifest_path": str(result.manifest_path),
+        # An assertion about this code path, not a metered reading: every git
+        # invocation here runs under ``protocol.allow=never``.
         "network_calls": 0,
+        "network_calls_authority": "HOST_ASSERTION_GIT_PROTOCOL_ALLOW_NEVER",
     }
 
 
