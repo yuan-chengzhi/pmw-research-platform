@@ -47,6 +47,7 @@ MAXIMUM_RUNTIME_DOCUMENT_BYTES = 16 * 1024 * 1024
 MAXIMUM_STATE_BYTES = 1 * 1024 * 1024
 MAXIMUM_INPUT_BYTES = 64 * 1024 * 1024
 MAXIMUM_SESSIONS = 4_096
+MAXIMUM_VERIFIER_KIT_LAUNCH_BYTES = 8_192
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _INPUT_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -77,7 +78,35 @@ _LAUNCH_FIELDS = frozenset({
     "backend_context_window_control",
     "required_readiness",
     "required_readiness_sha256",
+    "verifier_kit",
+    "verifier_kit_sha256",
     "host_policy",
+})
+# Literal in-session verifier-kit vocabulary, kept here for the same reason the
+# publication and resource-guard vocabularies are: the durable store validates
+# its own documents and must not import a producer to do it.
+_VERIFIER_KIT_LAUNCH_SCHEMA = "PMW_IN_SESSION_VERIFIER_KIT_LAUNCH_1"
+_VERIFIER_KIT_EVIDENCE_SCHEMA = "PMW_IN_SESSION_VERIFIER_KIT_SESSION_EVIDENCE_1"
+_IN_SESSION_VERIFIER_AUTHORITY = "ADVISORY_IN_SESSION_VERIFICATION"
+_SETTLEMENT_VERIFIER_AUTHORITY = "HOST_REEXECUTED_PINNED_AMF_VERIFIER"
+_VERIFIER_KIT_MODES = frozenset({"MATERIALIZED", "DISABLED"})
+_VERIFIER_KIT_LEDGERS = frozenset(
+    {"OBSERVED", "ABSENT", "UNREADABLE", "NOT_MATERIALIZED"}
+)
+_VERIFIER_VERDICT_STATUSES = frozenset({"PASS", "REJECTED", "APPARATUS_ERROR"})
+_VERIFIER_KIT_EVIDENCE_FIELDS = frozenset({
+    "schema",
+    "mode",
+    "authority",
+    "settlement_authority",
+    "counting_authority",
+    "evidence_directory",
+    "kit_content_sha256",
+    "ledger",
+    "invocation_count",
+    "verdict_counts",
+    "rejected_entries",
+    "truncated",
 })
 _RECEIPT_FIELDS = frozenset({
     "schema",
@@ -98,6 +127,7 @@ _RECEIPT_FIELDS = frozenset({
     "publications",
     "error",
     "resource_guard",
+    "verifier_kit",
     "context_window",
 })
 _STOP_PROOF_FIELDS = frozenset({
@@ -378,6 +408,101 @@ def _validate_resource_guard(value: object, *, session_id: str) -> None:
         _validate_resource_event(warning, session_id=session_id)
         if warning.get("disposition") != "WARN":
             _fail("MALFORMED_SESSION_RECEIPT", f"resource_guard {session_id}")
+
+
+def _validate_launch_verifier_kit(launch: Mapping[str, object]) -> None:
+    """Validate the launch-bound identity of the in-session verifier kit."""
+
+    value = launch.get("verifier_kit")
+    if type(value) is not dict:
+        _fail("MALFORMED_RUNTIME_LAUNCH", "verifier_kit")
+    raw = canonical_json(value)
+    if (
+        value.get("schema") != _VERIFIER_KIT_LAUNCH_SCHEMA
+        or value.get("mode") not in _VERIFIER_KIT_MODES
+        or value.get("authority") != _IN_SESSION_VERIFIER_AUTHORITY
+        or value.get("settlement_authority") != _SETTLEMENT_VERIFIER_AUTHORITY
+        or len(raw) > MAXIMUM_VERIFIER_KIT_LAUNCH_BYTES
+        or hashlib.sha256(raw).hexdigest() != launch.get("verifier_kit_sha256")
+    ):
+        _fail("MALFORMED_RUNTIME_LAUNCH", "verifier_kit")
+    if value["mode"] == "MATERIALIZED":
+        for label in (
+            "kit_sha256",
+            "content_sha256",
+            "manifest_sha256",
+            "interpreter_sha256",
+            "target_ids_sha256",
+        ):
+            digest = value.get(label)
+            if type(digest) is not str or _SHA256.fullmatch(digest) is None:
+                _fail("MALFORMED_RUNTIME_LAUNCH", f"verifier_kit.{label}")
+        if (
+            # A kit is a workspace input, so its launch identity must state
+            # that it carries no credential material.
+            value.get("credential_material") is not False
+            or type(value.get("file_count")) is not int
+            or value["file_count"] < 1  # type: ignore[operator]
+            or type(value.get("total_bytes")) is not int
+            or value["total_bytes"] < 1  # type: ignore[operator]
+            or type(value.get("target_count")) is not int
+            or value["target_count"] < 1  # type: ignore[operator]
+            or type(value.get("entrypoint")) is not str
+            or not value["entrypoint"]
+        ):
+            _fail("MALFORMED_RUNTIME_LAUNCH", "verifier_kit identity")
+
+
+def _validate_verifier_kit_evidence(
+    value: object,
+    *,
+    session_id: str,
+    launch: Mapping[str, object],
+) -> None:
+    if type(value) is not dict or set(value) != _VERIFIER_KIT_EVIDENCE_FIELDS:
+        _fail("MALFORMED_SESSION_RECEIPT", f"verifier_kit {session_id}")
+    counts = value.get("verdict_counts")
+    kit_digest = value.get("kit_content_sha256")
+    invocation_count = value.get("invocation_count")
+    rejected_entries = value.get("rejected_entries")
+    if (
+        value.get("schema") != _VERIFIER_KIT_EVIDENCE_SCHEMA
+        or value.get("mode") not in _VERIFIER_KIT_MODES
+        or value.get("authority") != _IN_SESSION_VERIFIER_AUTHORITY
+        or value.get("settlement_authority") != _SETTLEMENT_VERIFIER_AUTHORITY
+        or type(value.get("counting_authority")) is not str
+        or not value["counting_authority"]
+        or type(value.get("evidence_directory")) is not str
+        or not value["evidence_directory"]
+        or value.get("ledger") not in _VERIFIER_KIT_LEDGERS
+        or type(value.get("truncated")) is not bool
+        or type(invocation_count) is not int
+        or invocation_count < 0
+        or type(rejected_entries) is not int
+        or rejected_entries < 0
+        or type(counts) is not dict
+        or set(counts) != _VERIFIER_VERDICT_STATUSES
+        or any(type(item) is not int or item < 0 for item in counts.values())
+        or sum(counts.values()) != invocation_count
+        or (
+            kit_digest is not None
+            and (
+                type(kit_digest) is not str
+                or _SHA256.fullmatch(kit_digest) is None
+            )
+        )
+    ):
+        _fail("MALFORMED_SESSION_RECEIPT", f"verifier_kit {session_id}")
+    kit = launch.get("verifier_kit")
+    launch_mode = kit.get("mode") if type(kit) is dict else None
+    launch_digest = kit.get("content_sha256") if type(kit) is dict else None
+    if value["mode"] != launch_mode:
+        _fail("MALFORMED_SESSION_RECEIPT", f"verifier_kit mode {session_id}")
+    if value["mode"] == "MATERIALIZED":
+        if kit_digest != launch_digest or value["ledger"] == "NOT_MATERIALIZED":
+            _fail("MALFORMED_SESSION_RECEIPT", f"verifier_kit binding {session_id}")
+    elif kit_digest is not None or value["ledger"] != "NOT_MATERIALIZED":
+        _fail("MALFORMED_SESSION_RECEIPT", f"verifier_kit binding {session_id}")
 
 
 def _canonical_document(value: object, *, maximum_bytes: int) -> bytes:
@@ -800,6 +925,7 @@ class RuntimeStore:
             "backend_sha256",
             "publication_sha256",
             "required_readiness_sha256",
+            "verifier_kit_sha256",
         ):
             digest = launch.get(label)
             if type(digest) is not str or _SHA256.fullmatch(digest) is None:
@@ -953,6 +1079,7 @@ class RuntimeStore:
             )
         ):
             _fail("MALFORMED_RUNTIME_LAUNCH", "context_window_policy")
+        _validate_launch_verifier_kit(launch)
         if launch.get("host_policy") != runtime_host_policy_value():
             _fail("MALFORMED_RUNTIME_LAUNCH", "host_policy")
         readiness = launch.get("required_readiness")
@@ -1192,6 +1319,9 @@ class RuntimeStore:
         _validate_receipt_error(value.get("error"), session_id=session_id)
         _validate_resource_guard(
             value.get("resource_guard"), session_id=session_id
+        )
+        _validate_verifier_kit_evidence(
+            value.get("verifier_kit"), session_id=session_id, launch=launch
         )
         context_window = value.get("context_window")
         launch_context = launch.get("context_window_policy")

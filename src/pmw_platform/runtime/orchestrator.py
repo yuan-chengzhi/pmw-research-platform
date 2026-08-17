@@ -19,6 +19,14 @@ from pathlib import Path
 from typing import Awaitable, Protocol, Sequence
 
 from ..sessions import SessionSpec, SessionStatus
+from ..verifier_kit import (
+    VerifierKit,
+    absent_verifier_kit_announcement,
+    disabled_verifier_kit_launch_value,
+    disabled_verifier_kit_session_evidence,
+    read_session_verifier_kit_evidence,
+    unreadable_verifier_kit_session_evidence,
+)
 from ..world import ResearchContribution
 from ..world.records import canonical_json
 from .auth import PreparedCohort, authenticate_plan_bundle
@@ -208,6 +216,7 @@ def build_launch_manifest(
         ContextWindowControl.NOT_APPLICABLE
     ),
     required_readiness: RequiredReadinessIdentity | None = None,
+    verifier_kit: VerifierKit | None = None,
 ) -> dict[str, object]:
     """Build the immutable execution identity, separate from the math plan."""
 
@@ -236,6 +245,13 @@ def build_launch_manifest(
     )
     if not isinstance(selected_readiness, RequiredReadinessIdentity):
         raise TypeError("required_readiness must be RequiredReadinessIdentity")
+    if verifier_kit is not None and not isinstance(verifier_kit, VerifierKit):
+        raise TypeError("verifier_kit must be VerifierKit")
+    kit_value = (
+        disabled_verifier_kit_launch_value()
+        if verifier_kit is None
+        else verifier_kit.launch_value()
+    )
     session_ids = [item.session_id for item in prepared.plan.sessions]
     return {
         "schema": RUNTIME_LAUNCH_SCHEMA,
@@ -260,6 +276,10 @@ def build_launch_manifest(
         "backend_context_window_control": context_window_control.value,
         "required_readiness": selected_readiness.to_value(),
         "required_readiness_sha256": selected_readiness.sha256,
+        "verifier_kit": kit_value,
+        "verifier_kit_sha256": hashlib.sha256(
+            canonical_json(kit_value)
+        ).hexdigest(),
         "host_policy": runtime_host_policy_value(),
     }
 
@@ -280,6 +300,7 @@ class _Controller:
         publication_identity: PublicationIdentity,
         required_readiness: RequiredReadinessIdentity,
         resource_guard: ResourceGuard,
+        verifier_kit: VerifierKit | None = None,
     ) -> None:
         self.prepared = prepared
         self.backend = backend
@@ -293,6 +314,7 @@ class _Controller:
         self.publication_identity = publication_identity
         self.required_readiness = required_readiness
         self.resource_guard = resource_guard
+        self.verifier_kit = verifier_kit
         self.stop_new = asyncio.Event()
         self.external_cancel = False
         self.unsafe = False
@@ -388,10 +410,31 @@ class _Controller:
                 "strict_pre_http_input_gate": False,
             },
             "required_readiness": self.required_readiness.to_value(),
+            # Announce the in-session capability on the same authenticated
+            # surface every backend already reads.  It states what exists and
+            # how to call it; it recommends no research route.
+            "verifier_kit": (
+                absent_verifier_kit_announcement()
+                if self.verifier_kit is None
+                else self.verifier_kit.briefing_announcement()
+            ),
         }
+
+    def _verifier_kit_evidence(self, spec: SessionSpec) -> dict[str, object]:
+        if self.verifier_kit is None:
+            return disabled_verifier_kit_session_evidence()
+        try:
+            workspace = self.store.session_paths(spec.session_id).workspace
+            return read_session_verifier_kit_evidence(self.verifier_kit, workspace)
+        except BaseException:
+            # An unreadable advisory ledger must never break settlement, and
+            # must never be reported as a measured zero.
+            return unreadable_verifier_kit_session_evidence(self.verifier_kit)
 
     def _request(self, spec: SessionSpec) -> SessionRequest:
         paths = self.store.session_paths(spec.session_id)
+        if self.verifier_kit is not None:
+            self.verifier_kit.materialize(paths.workspace)
         briefing_path = self.store.write_input_file(
             spec.session_id,
             "briefing.json",
@@ -479,6 +522,7 @@ class _Controller:
                 }
             ),
             "resource_guard": self.resource_guard.evidence(spec.session_id),
+            "verifier_kit": self._verifier_kit_evidence(spec),
             "context_window": {
                 "semantics": CONTEXT_WINDOW_SEMANTICS,
                 "configured_tokens": self.context_policy.for_session(
@@ -1061,6 +1105,7 @@ async def run_prepared_cohort(
     context_policy: ContextWindowPolicy | None = None,
     publisher: ContributionPublisher | None = None,
     required_checkers: Sequence[RequiredReadinessChecker] = (),
+    verifier_kit: VerifierKit | None = None,
 ) -> RuntimeRunResult:
     """Run exactly the sessions frozen in one authenticated plan bundle."""
 
@@ -1078,6 +1123,8 @@ async def run_prepared_cohort(
         required_checkers, Sequence
     ):
         raise TypeError("required_checkers must be a sequence")
+    if verifier_kit is not None and not isinstance(verifier_kit, VerifierKit):
+        raise TypeError("verifier_kit must be VerifierKit")
     identity = backend.identity
     if not isinstance(identity, BackendIdentity):
         raise TypeError("backend.identity must be BackendIdentity")
@@ -1145,6 +1192,7 @@ async def run_prepared_cohort(
             selected_context,
             context_window_control,
             required_readiness,
+            verifier_kit,
         )
         launch_sha256 = store.create_launch(
             launch,
@@ -1172,6 +1220,7 @@ async def run_prepared_cohort(
             publication_identity=publication_identity,
             required_readiness=required_readiness,
             resource_guard=resource_guard,
+            verifier_kit=verifier_kit,
         )
         controller._observe_resource_event(initial_resource_event)
         workers = tuple(
@@ -1251,6 +1300,7 @@ async def run_runtime_cohort(
     context_policy: ContextWindowPolicy | None = None,
     publisher: ContributionPublisher | None = None,
     required_checkers: Sequence[RequiredReadinessChecker] = (),
+    verifier_kit: VerifierKit | None = None,
     profiles_dir: str | Path | None = None,
     core_lock_path: str | Path | None = None,
 ) -> RuntimeRunResult:
@@ -1269,4 +1319,5 @@ async def run_runtime_cohort(
         context_policy=context_policy,
         publisher=publisher,
         required_checkers=required_checkers,
+        verifier_kit=verifier_kit,
     )

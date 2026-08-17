@@ -47,6 +47,7 @@ from .sessions import CohortPlan, PlanStoreError, plan_sha256, save_plan
 from .source_lock import SourceLockError, load_core_lock
 from .source_materializer import MaterializedSource, SourceMaterializer
 from .verifier import AmfVerifierService, VerifierStatus
+from .verifier_kit import VerifierKit, VerifierKitError, build_verifier_kit
 from .world import (
     ResearchWorld,
     ResearchWorldError,
@@ -457,6 +458,30 @@ def _runtime_preflight_checkers(args: argparse.Namespace) -> tuple[object, ...]:
     return tuple(checkers)
 
 
+def _runtime_verifier_kit(
+    args: argparse.Namespace, prepared: object
+) -> VerifierKit | None:
+    """Build the read-only in-session verifier kit for this launch.
+
+    The kit is bound to the same briefing-derived portfolio the settlement
+    verifier uses, so it exists exactly when the launch asserts the AMF
+    apparatus.  ``runtime-only`` makes no mathematical-apparatus assertion and
+    therefore ships no verifier into a workspace.
+    """
+
+    if getattr(args, "no_verifier_kit", False):
+        return None
+    if args.readiness_scope != "amf-production":
+        return None
+    return build_verifier_kit(
+        source_materializer=SourceMaterializer(_runtime_data_root(args)),
+        target_bindings=target_bindings_from_briefing(
+            prepared.briefing_bytes  # type: ignore[attr-defined]
+        ),
+        python_executable=Path(sys.executable).resolve(strict=True),
+    )
+
+
 def _runtime_preflight_report(
     args: argparse.Namespace,
     prepared: object,
@@ -492,6 +517,7 @@ def _session_start(args: argparse.Namespace) -> int:
     if not report.ready:
         _emit(report.to_value(), stream=sys.stderr)
         return 1
+    verifier_kit = _runtime_verifier_kit(args, prepared)
     try:
         result = asyncio.run(
             _with_latched_sigint(
@@ -502,6 +528,7 @@ def _session_start(args: argparse.Namespace) -> int:
                     context_policy=context_policy,
                     publisher=publisher,
                     required_checkers=checkers,
+                    verifier_kit=verifier_kit,
                 )
             )
         )
@@ -524,6 +551,9 @@ def _session_start(args: argparse.Namespace) -> int:
         "outcome": result.outcome,
         "counts": result.settlement["counts"],
         "runtime_root": str(prepared.cohort_root / "runtime"),
+        "verifier_kit_sha256": (
+            None if verifier_kit is None else verifier_kit.sha256
+        ),
     })
     return 0 if result.outcome == "SUCCEEDED" else 1
 
@@ -805,6 +835,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="explicitly run one authenticated cohort through a selected backend",
     )
     add_launch_arguments(session_start)
+    session_start.add_argument(
+        "--no-verifier-kit",
+        action="store_true",
+        help=(
+            "do not materialize the read-only in-session verifier kit into "
+            "each session workspace; host verification is unaffected"
+        ),
+    )
     session_start.set_defaults(handler=_session_start)
 
     session_preflight = session_commands.add_parser(
@@ -893,6 +931,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         CommandBackendError,
         SafetyProfileError,
         SourceLockError,
+        VerifierKitError,
         ValueError,
     ) as error:
         _emit(

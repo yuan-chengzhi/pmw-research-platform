@@ -100,12 +100,22 @@ provide a bounded-output proxy between a built-in tool and Pi's model context.
 Consequently a large tool result may consume the configured active context
 window even when retained transport evidence remains bounded.
 
-The AMF verifier is host-authoritative but currently post-settlement only. It
-captures a workspace-relative candidate into CAS and re-executes a verifier
-from the audited locked source, with bounded output/time, stripped credentials
-and a top-level Python socket audit denial. This is not kernel network
-isolation, and no verifier tool is exposed live to an agent. Likewise, the
-generic runtime currently exposes no live PMW read/query/peer-update tool plane.
+The AMF verifier is host-authoritative and post-settlement. It captures a
+workspace-relative candidate into CAS and re-executes a verifier from the
+audited locked source, with bounded output/time, stripped credentials and a
+top-level Python socket audit denial. This is not kernel network isolation.
+
+A launch may also materialize a read-only, content-pinned verifier kit into a
+session workspace. It ships only platform bytes, pinned verifier source bytes
+and public pin digests — no credential material — and runs the pinned verifier
+under the same isolated interpreter, credential-free environment, socket-audit
+bootstrap, manifest time/output caps and process-group cleanup as the host
+path. Its verdicts are `ADVISORY_IN_SESSION_VERIFICATION` and never settle
+anything. Read-only mode bits inside a session-owned workspace are hygiene, not
+containment, so the kit re-checks every pinned digest at each invocation, and
+the host counts the session-local invocation ledger as an observation rather
+than a proven measurement. The runtime still exposes no live PMW
+read/query/peer-update tool plane.
 
 These controls are operational guardrails, not a hostile-code OS sandbox.
 Process groups and filtered environments do not prevent a deliberately

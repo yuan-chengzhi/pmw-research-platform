@@ -18,6 +18,10 @@ from pmw_platform.runtime.store import (
     RuntimeStore,
     RuntimeStoreError,
 )
+from pmw_platform.verifier_kit import (
+    disabled_verifier_kit_launch_value,
+    disabled_verifier_kit_session_evidence,
+)
 from pmw_platform.world.records import canonical_json
 
 
@@ -37,6 +41,7 @@ def _launch(session_ids: list[str]) -> dict[str, object]:
         "schema": "PMW_RUNTIME_REQUIRED_READINESS_1",
         "checks": [],
     }
+    verifier_kit = disabled_verifier_kit_launch_value()
     return {
         "schema": "PMW_RUNTIME_LAUNCH_1",
         "created_at": "2026-08-16T00:00:00Z",
@@ -67,6 +72,10 @@ def _launch(session_ids: list[str]) -> dict[str, object]:
         "required_readiness": readiness,
         "required_readiness_sha256": hashlib.sha256(
             canonical_json(readiness)
+        ).hexdigest(),
+        "verifier_kit": verifier_kit,
+        "verifier_kit_sha256": hashlib.sha256(
+            canonical_json(verifier_kit)
         ).hexdigest(),
         "host_policy": runtime_host_policy_value(),
     }
@@ -134,6 +143,7 @@ def _receipt(
             "terminal_event": None,
             "warnings": [],
         },
+        "verifier_kit": disabled_verifier_kit_session_evidence(),
         "context_window": {
             "semantics": (
                 "ACTIVE_MODEL_CONTEXT_WINDOW_TOKENS_NOT_CUMULATIVE_SESSION_USAGE"

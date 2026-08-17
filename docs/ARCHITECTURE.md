@@ -216,14 +216,23 @@ content-addressed receipt under the session evidence tree. The verifier runner
 removes credentials and installs a top-level Python socket audit denial, but it
 does not claim kernel-level network isolation.
 
-There is no agent-facing live verifier tool in this version, and there is no
-live PMW read/query/peer-update coordination plane comparable to the historical
-M01–M03 apparatus. The runtime can carry an authenticated static briefing and an
-optional end-of-session publisher; those facts must not be presented as a full
-interactive mathematical-research platform. A session with explicitly enabled
-`read`/`bash` may inspect the readiness-bound source tree and run a verifier as
-a self-check, but only the later host execution produces an authoritative
-verifier receipt.
+A launch may additionally materialize a read-only, content-pinned **in-session
+verifier kit** into each session workspace: a wrapper CLI executing the same
+pinned verifier bytes locally, whose per-invocation verdict and receipt land in
+a session-local evidence directory and are explicitly
+`ADVISORY_IN_SESSION_VERIFICATION`. The kit's byte identity is frozen into
+`launch.json`, the invocation surface announces its existence and command
+without recommending a route, and the host counts observed invocations into the
+session receipt. Because the workspace belongs to the session, that ledger is an
+observation and not a tamper-proof measurement; the post-settlement host
+execution remains the only authoritative verifier receipt.
+
+There is still no live PMW read/query/peer-update coordination plane comparable
+to the historical M01–M03 apparatus, and no agent-facing path can produce an
+authoritative verdict. The runtime can carry an authenticated static briefing,
+an advisory verification path and an optional end-of-session publisher; those
+facts must not be presented as a full interactive mathematical-research
+platform.
 
 ## Resource and safety enforcement
 
@@ -264,7 +273,9 @@ schema migration.
 
 - no claim that process-group control equals OS containment;
 - no automatic model/OAuth canary, retry, compaction or context ceiling;
-- no live agent-facing verifier or PMW coordination tool plane;
+- no authoritative agent-facing verifier and no PMW coordination tool plane;
+  the in-session kit is advisory and its invocation ledger is observed, not
+  proven;
 - no automatic resume or reuse of a crashed/settled launch; cross-system
   publication gaps require explicit reconciliation;
 - no new M04/M05 treatment, ballot or all-agent barrier;
