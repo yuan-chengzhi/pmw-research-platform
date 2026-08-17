@@ -174,12 +174,14 @@ def test_session_start_routes_authenticated_plan_backend_and_limits(
         context_policy: object,
         publisher: object,
         required_checkers: object,
+        verifier_kit: object,
     ) -> object:
         observed["run"] = (selected_prepared, selected_backend)
         observed["limits"] = limits
         observed["context_policy"] = context_policy
         observed["publisher"] = publisher
         observed["required_checkers"] = required_checkers
+        observed["verifier_kit"] = verifier_kit
         return SimpleNamespace(
             launch_sha256="a" * 64,
             settlement_sha256="b" * 64,
@@ -218,6 +220,7 @@ def test_session_start_routes_authenticated_plan_backend_and_limits(
             "--no-wall-limit",
             "--stop-grace-seconds",
             "3",
+            "--no-verifier-kit",
         ]
     )
 
@@ -231,6 +234,7 @@ def test_session_start_routes_authenticated_plan_backend_and_limits(
     assert limits.stop_grace_seconds == 3.0
     assert observed["context_policy"].configured is False
     assert observed["publisher"] is None
+    assert observed["verifier_kit"] is None
     assert emitted == [
         (
             {
@@ -241,10 +245,135 @@ def test_session_start_routes_authenticated_plan_backend_and_limits(
                 "outcome": outcome,
                 "counts": {outcome: 4},
                 "runtime_root": str(prepared.cohort_root / "runtime"),
+                "verifier_kit_sha256": None,
             },
             cli.sys.stdout,
         )
     ]
+
+
+def test_session_start_materializes_the_in_session_verifier_kit_by_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cohort_id = "cohort-kit"
+    prepared = _prepared(tmp_path, cohort_id)
+    prepared.briefing_bytes = b'{"schema":"TEST_BRIEFING_1"}\n'
+    bindings = object()
+    kit = SimpleNamespace(sha256="e" * 64)
+    observed: dict[str, object] = {}
+    emitted: list[object] = []
+
+    def fake_bindings(raw: bytes) -> object:
+        observed["briefing_bytes"] = raw
+        return bindings
+
+    def fake_build(
+        *,
+        source_materializer: object,
+        target_bindings: object,
+        python_executable: object,
+    ) -> object:
+        observed["build"] = (
+            source_materializer.data_root,  # type: ignore[attr-defined]
+            target_bindings,
+            python_executable,
+        )
+        return kit
+
+    async def fake_run(*_args: object, **kwargs: object) -> object:
+        observed["verifier_kit"] = kwargs["verifier_kit"]
+        return SimpleNamespace(
+            launch_sha256="a" * 64,
+            settlement_sha256="b" * 64,
+            outcome="SUCCEEDED",
+            settlement={"counts": {"SUCCEEDED": 1}},
+        )
+
+    monkeypatch.setattr(cli, "authenticate_plan_bundle", lambda *_args: prepared)
+    monkeypatch.setattr(cli, "load_command_backend", lambda _path: object())
+    monkeypatch.setattr(cli, "target_bindings_from_briefing", fake_bindings)
+    monkeypatch.setattr(cli, "build_verifier_kit", fake_build)
+    monkeypatch.setattr(cli, "run_prepared_cohort", fake_run)
+    monkeypatch.setattr(
+        cli,
+        "_runtime_preflight_report",
+        lambda *_args: SimpleNamespace(ready=True),
+    )
+    monkeypatch.setattr(cli, "_emit", lambda value, **_kwargs: emitted.append(value))
+
+    result = cli.main(
+        [
+            "--data-root",
+            str(tmp_path),
+            "session",
+            "start",
+            "--cohort",
+            cohort_id,
+            "--backend",
+            "command",
+            "--backend-config",
+            str(tmp_path / "backend.json"),
+        ]
+    )
+
+    assert result == 0
+    assert observed["briefing_bytes"] == prepared.briefing_bytes
+    assert observed["build"] == (tmp_path, bindings, Path(cli.sys.executable).resolve())
+    assert observed["verifier_kit"] is kit
+    assert emitted[0]["verifier_kit_sha256"] == "e" * 64  # type: ignore[index]
+
+
+def test_session_start_runtime_only_scope_ships_no_verifier_kit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepared = _prepared(tmp_path, "cohort-runtime-only")
+    observed: dict[str, object] = {}
+
+    async def fake_run(*_args: object, **kwargs: object) -> object:
+        observed["verifier_kit"] = kwargs["verifier_kit"]
+        return SimpleNamespace(
+            launch_sha256="a" * 64,
+            settlement_sha256="b" * 64,
+            outcome="SUCCEEDED",
+            settlement={"counts": {"SUCCEEDED": 1}},
+        )
+
+    monkeypatch.setattr(cli, "authenticate_plan_bundle", lambda *_args: prepared)
+    monkeypatch.setattr(cli, "load_command_backend", lambda _path: object())
+    monkeypatch.setattr(
+        cli,
+        "build_verifier_kit",
+        lambda **_kwargs: pytest.fail("runtime-only must not build a kit"),
+    )
+    monkeypatch.setattr(cli, "run_prepared_cohort", fake_run)
+    monkeypatch.setattr(
+        cli,
+        "_runtime_preflight_report",
+        lambda *_args: SimpleNamespace(ready=True),
+    )
+    monkeypatch.setattr(cli, "_emit", lambda _value, **_kwargs: None)
+
+    result = cli.main(
+        [
+            "--data-root",
+            str(tmp_path),
+            "session",
+            "start",
+            "--cohort",
+            "cohort-runtime-only",
+            "--backend",
+            "command",
+            "--backend-config",
+            str(tmp_path / "backend.json"),
+            "--readiness-scope",
+            "runtime-only",
+        ]
+    )
+
+    assert result == 0
+    assert observed["verifier_kit"] is None
 
 
 def test_session_start_routes_writer_authority_only_to_host_publisher(
@@ -281,11 +410,13 @@ def test_session_start_routes_writer_authority_only_to_host_publisher(
         context_policy: object,
         publisher: object,
         required_checkers: object,
+        verifier_kit: object,
     ) -> object:
         observed["backend"] = selected_backend
         observed["publisher"] = publisher
         observed["context_policy"] = context_policy
         observed["required_checkers"] = required_checkers
+        observed["verifier_kit"] = verifier_kit
         return SimpleNamespace(
             launch_sha256="c" * 64,
             settlement_sha256="d" * 64,
@@ -321,6 +452,7 @@ def test_session_start_routes_writer_authority_only_to_host_publisher(
             str(tmp_path / "backend.json"),
             "--writer-authority",
             str(authority_path),
+            "--no-verifier-kit",
         ]
     )
 
@@ -379,6 +511,7 @@ def test_session_start_interrupt_reports_status_and_returns_130(
             "command",
             "--backend-config",
             str(tmp_path / "backend.json"),
+            "--no-verifier-kit",
         ]
     )
 

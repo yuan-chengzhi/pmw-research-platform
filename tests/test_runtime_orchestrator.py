@@ -375,6 +375,7 @@ def test_public_runtime_entrypoint_forwards_context_and_readiness(
             "context_policy": policy,
             "publisher": None,
             "required_checkers": (checker,),
+            "verifier_kit": None,
         },
     )
 
