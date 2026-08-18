@@ -12,6 +12,10 @@ import pytest
 
 from pmw_platform.runtime.context import ContextWindowPolicy
 from pmw_platform.runtime.contracts import runtime_host_policy_value
+from pmw_platform.runtime.orchestrator import (
+    not_configured_agenda_arm_launch_value,
+    not_configured_agenda_arm_session_evidence,
+)
 from pmw_platform.runtime.store import (
     RUNTIME_STATE_SCHEMA,
     RuntimeClaim,
@@ -43,6 +47,7 @@ def _launch(session_ids: list[str]) -> dict[str, object]:
         "checks": [],
     }
     verifier_kit = disabled_verifier_kit_launch_value()
+    agenda_arm = not_configured_agenda_arm_launch_value()
     return {
         "schema": "PMW_RUNTIME_LAUNCH_1",
         "created_at": "2026-08-16T00:00:00Z",
@@ -77,6 +82,10 @@ def _launch(session_ids: list[str]) -> dict[str, object]:
         "verifier_kit": verifier_kit,
         "verifier_kit_sha256": hashlib.sha256(
             canonical_json(verifier_kit)
+        ).hexdigest(),
+        "agenda_arm": agenda_arm,
+        "agenda_arm_sha256": hashlib.sha256(
+            canonical_json(agenda_arm)
         ).hexdigest(),
         "host_policy": runtime_host_policy_value(),
     }
@@ -149,6 +158,7 @@ def _receipt(
             detail="test receipt",
         ).to_value(),
         "verifier_kit": disabled_verifier_kit_session_evidence(),
+        "agenda_arm": not_configured_agenda_arm_session_evidence(),
         "context_window": {
             "semantics": (
                 "ACTIVE_MODEL_CONTEXT_WINDOW_TOKENS_NOT_CUMULATIVE_SESSION_USAGE"

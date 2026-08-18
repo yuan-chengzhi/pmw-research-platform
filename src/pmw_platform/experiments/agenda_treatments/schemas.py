@@ -35,6 +35,7 @@ TASK_RELEASE_SCHEMA = "PMW_AGENDA_TASK_RELEASE_1"
 TASK_OUTCOME_SCHEMA = "PMW_AGENDA_TASK_OUTCOME_1"
 DIRECTIVE_SCHEMA = "PMW_AGENDA_DIRECTIVE_1"
 DECOMPOSITION_SCHEMA = "PMW_AGENDA_DECOMPOSITION_1"
+ROUTE_DECLARATION_SCHEMA = "PMW_AGENDA_ROUTE_DECLARATION_1"
 
 AGENDA_TREATMENT_SCHEMAS = frozenset({
     TASK_PROPOSAL_SCHEMA,
@@ -44,6 +45,7 @@ AGENDA_TREATMENT_SCHEMAS = frozenset({
     TASK_OUTCOME_SCHEMA,
     DIRECTIVE_SCHEMA,
     DECOMPOSITION_SCHEMA,
+    ROUTE_DECLARATION_SCHEMA,
 })
 
 # Which of the six existing kinds may carry each treatment payload.  A record
@@ -65,6 +67,9 @@ TREATMENT_KIND_BINDING: Mapping[str, frozenset[str]] = {
     # A decomposition asserts that sublemmas jointly suffice for a target.
     # That is a mathematical claim, so it rides RESULT.
     DECOMPOSITION_SCHEMA: frozenset({"RESULT"}),
+    # A route declaration says which route this session took and which peer
+    # records moved it there.  That is work in progress, so it rides ATTEMPT.
+    ROUTE_DECLARATION_SCHEMA: frozenset({"ATTEMPT"}),
 }
 
 # Enforced at import: the plugin rides the closed six-kind vocabulary and can
@@ -132,9 +137,12 @@ HOST_INJECTED_IDENTITY_KEYS = frozenset({
 MAXIMUM_STATEMENT_BYTES = 8_000
 MAXIMUM_DETAIL_BYTES = 8_000
 MAXIMUM_INSTRUCTION_BYTES = 8_000
+MAXIMUM_ROUTE_STATEMENT_BYTES = 8_000
+MAXIMUM_DIFFERENTIATION_NOTE_BYTES = 8_000
 MAXIMUM_DEPENDENCY_REFS = 32
 MAXIMUM_SUPERSEDES_REFS = 16
 MAXIMUM_CITED_DIRECTIVE_REFS = 16
+MAXIMUM_PEER_TRIGGER_REFS = 16
 MAXIMUM_SUBLEMMAS = 64
 MAXIMUM_LEASE_TICKS = 1 << 31
 
@@ -658,6 +666,65 @@ class DecompositionPayload:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class RouteDeclarationPayload:
+    """Which route a session took, and which peer records moved it there.
+
+    This is *telemetry*, not an instrument of authority: it grants nothing,
+    claims nothing and blocks nobody.  It exists because the live stack lost
+    route measurability when the differentiated-route field was dropped and
+    peer-trigger references came back empty.  ``peer_trigger_refs`` names
+    admissions the session says it read; a host validator resolves them against
+    the snapshot and rejects a dangling reference rather than recording an
+    unverifiable citation.
+    """
+
+    route_statement: str
+    peer_trigger_refs: tuple[str, ...]
+    differentiation_note: str | None
+
+    def to_value(self) -> dict[str, object]:
+        return {
+            "schema": ROUTE_DECLARATION_SCHEMA,
+            "route_statement": self.route_statement,
+            "peer_trigger_refs": list(self.peer_trigger_refs),
+            "differentiation_note": self.differentiation_note,
+        }
+
+    @classmethod
+    def parse(cls, value: object) -> "RouteDeclarationPayload":
+        selected = _typed_fields(
+            value,
+            schema=ROUTE_DECLARATION_SCHEMA,
+            expected=frozenset({
+                "schema",
+                "route_statement",
+                "peer_trigger_refs",
+                "differentiation_note",
+            }),
+        )
+        note = selected["differentiation_note"]
+        if note is not None:
+            note = _text(
+                note,
+                label="differentiation_note",
+                maximum_bytes=MAXIMUM_DIFFERENTIATION_NOTE_BYTES,
+            )
+        return cls(
+            route_statement=_text(
+                selected["route_statement"],
+                label="route_statement",
+                maximum_bytes=MAXIMUM_ROUTE_STATEMENT_BYTES,
+            ),
+            peer_trigger_refs=_ref_tuple(
+                selected["peer_trigger_refs"],
+                label="peer_trigger_refs",
+                maximum=MAXIMUM_PEER_TRIGGER_REFS,
+            ),
+            differentiation_note=note,
+        )
+
+
 def _typed_fields(
     value: object,
     *,
@@ -699,6 +766,7 @@ PAYLOAD_PARSERS: Mapping[str, Callable[[object], Any]] = {
     TASK_OUTCOME_SCHEMA: TaskOutcomePayload.parse,
     DIRECTIVE_SCHEMA: DirectivePayload.parse,
     DECOMPOSITION_SCHEMA: DecompositionPayload.parse,
+    ROUTE_DECLARATION_SCHEMA: RouteDeclarationPayload.parse,
 }
 
 

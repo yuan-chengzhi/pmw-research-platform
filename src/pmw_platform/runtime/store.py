@@ -81,6 +81,8 @@ _LAUNCH_FIELDS = frozenset({
     "required_readiness_sha256",
     "verifier_kit",
     "verifier_kit_sha256",
+    "agenda_arm",
+    "agenda_arm_sha256",
     "host_policy",
 })
 # Literal in-session verifier-kit vocabulary, kept here for the same reason the
@@ -109,6 +111,83 @@ _VERIFIER_KIT_EVIDENCE_FIELDS = frozenset({
     "rejected_entries",
     "truncated",
 })
+# Agenda-arm vocabulary, held here for the same reason as the verifier-kit
+# vocabulary above: the durable store validates its own documents and must not
+# import a producer -- least of all an experiment plugin -- to do it.
+_AGENDA_ARM_LAUNCH_SCHEMA = "PMW_AGENDA_ARM_LAUNCH_1"
+_AGENDA_ARM_EVIDENCE_SCHEMA = "PMW_AGENDA_ARM_SESSION_EVIDENCE_1"
+_AGENDA_ARM_MODES = frozenset({"ENFORCED", "NOT_CONFIGURED"})
+_AGENDA_ARM_LAUNCH_FIELDS = frozenset({
+    "schema",
+    "mode",
+    "arm",
+    "instruments",
+    "admitted_payload_schemas",
+    "coordinator_session_ids",
+    "admitting_slots",
+    "open_admission",
+    "require_claim_for_primary_action",
+    "enforce_directive_citation",
+    "agenda_clock",
+    "lease_release",
+    "enforcement",
+    "rejection_semantics",
+})
+_AGENDA_ARM_LAUNCH_ABSENT_FIELDS = frozenset({
+    "schema",
+    "mode",
+    "reason",
+    "enforcement",
+})
+_AGENDA_ARM_EVIDENCE_FIELDS = frozenset({
+    "schema",
+    "mode",
+    "arm",
+    "arm_sha256",
+    "reviewed",
+    "admitted",
+    "rejected",
+    "verdicts",
+    "instrument_attempts",
+    "records_by_schema",
+    "route_declarations",
+    "lease_release",
+    "agenda_clock",
+    "decisions",
+    "truncated",
+    "publication_divergences",
+    "rejection_semantics",
+})
+_AGENDA_ARM_EVIDENCE_ABSENT_FIELDS = frozenset({
+    "schema",
+    "mode",
+    "arm",
+    "arm_sha256",
+    "reviewed",
+    "admitted",
+    "rejected",
+    "reason",
+})
+_AGENDA_ARM_ROUTE_FIELDS = frozenset({
+    "count",
+    "with_peer_trigger_refs",
+    "resolved_peer_trigger_refs",
+    "dangling_rejected",
+    "differentiation_notes",
+})
+_AGENDA_ARM_DECISION_FIELDS = frozenset({
+    "ordinal",
+    "kind",
+    "payload_schema",
+    "instrument",
+    "code",
+    "admitted",
+    "detail",
+})
+_AGENDA_VERDICT_CODE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+MAXIMUM_AGENDA_ARM_LAUNCH_BYTES = 262_144
+MAXIMUM_AGENDA_ARM_EVIDENCE_BYTES = 262_144
+MAXIMUM_AGENDA_ARM_DECISIONS = 64
 _RECEIPT_FIELDS = frozenset({
     "schema",
     "launch_sha256",
@@ -130,6 +209,7 @@ _RECEIPT_FIELDS = frozenset({
     "resource_guard",
     "usage",
     "verifier_kit",
+    "agenda_arm",
     "context_window",
 })
 _STOP_PROOF_FIELDS = frozenset({
@@ -505,6 +585,248 @@ def _validate_verifier_kit_evidence(
             _fail("MALFORMED_SESSION_RECEIPT", f"verifier_kit binding {session_id}")
     elif kit_digest is not None or value["ledger"] != "NOT_MATERIALIZED":
         _fail("MALFORMED_SESSION_RECEIPT", f"verifier_kit binding {session_id}")
+
+
+def _validate_launch_agenda_arm(launch: Mapping[str, object]) -> None:
+    """Validate the launch-bound identity of this cohort's agenda arm."""
+
+    value = launch.get("agenda_arm")
+    if type(value) is not dict:
+        _fail("MALFORMED_RUNTIME_LAUNCH", "agenda_arm")
+    raw = canonical_json(value)
+    if (
+        value.get("schema") != _AGENDA_ARM_LAUNCH_SCHEMA
+        or value.get("mode") not in _AGENDA_ARM_MODES
+        or len(raw) > MAXIMUM_AGENDA_ARM_LAUNCH_BYTES
+        or hashlib.sha256(raw).hexdigest() != launch.get("agenda_arm_sha256")
+    ):
+        _fail("MALFORMED_RUNTIME_LAUNCH", "agenda_arm")
+    if value["mode"] == "NOT_CONFIGURED":
+        if set(value) != _AGENDA_ARM_LAUNCH_ABSENT_FIELDS:
+            _fail("MALFORMED_RUNTIME_LAUNCH", "agenda_arm")
+        return
+    if set(value) != _AGENDA_ARM_LAUNCH_FIELDS:
+        _fail("MALFORMED_RUNTIME_LAUNCH", "agenda_arm")
+    session_ids = set(RuntimeStore._launch_session_ids(launch))
+    instruments = value.get("instruments")
+    schemas = value.get("admitted_payload_schemas")
+    coordinators = value.get("coordinator_session_ids")
+    admitting = value.get("admitting_slots")
+    if (
+        type(value.get("arm")) is not str
+        or not value["arm"]
+        or type(instruments) is not list
+        or not instruments
+        or not all(type(item) is str and item for item in instruments)
+        or sorted(set(instruments)) != sorted(instruments)
+        or type(schemas) is not list
+        or sorted(set(schemas)) != schemas
+        or not all(type(item) is str and item for item in schemas)
+        or type(coordinators) is not list
+        or sorted(set(coordinators)) != coordinators
+        or not set(coordinators) <= session_ids
+        or type(value.get("open_admission")) is not bool
+        or type(value.get("require_claim_for_primary_action")) is not bool
+        or type(value.get("enforce_directive_citation")) is not bool
+        or type(value.get("agenda_clock")) is not str
+        or type(value.get("lease_release")) is not str
+        or type(value.get("enforcement")) is not str
+        or type(value.get("rejection_semantics")) is not str
+    ):
+        _fail("MALFORMED_RUNTIME_LAUNCH", "agenda_arm identity")
+    # Open admission is the D arm's "any session, at any time"; the explicit
+    # form must name only sessions this launch actually runs.
+    if value["open_admission"]:
+        if admitting != "ALL_SESSIONS":
+            _fail("MALFORMED_RUNTIME_LAUNCH", "agenda_arm admitting_slots")
+    elif (
+        type(admitting) is not list
+        or sorted(set(admitting)) != admitting
+        or not set(admitting) <= session_ids
+    ):
+        _fail("MALFORMED_RUNTIME_LAUNCH", "agenda_arm admitting_slots")
+
+
+def _agenda_counts(value: object, *, expected: frozenset[str] | None) -> int | None:
+    """Return the total of a bounded ``str -> non-negative int`` count map."""
+
+    if type(value) is not dict:
+        return None
+    if expected is not None and set(value) != expected:
+        return None
+    total = 0
+    for key, count in value.items():
+        if (
+            type(key) is not str
+            or not key
+            or len(key.encode("utf-8")) > 128
+            or type(count) is not int
+            or isinstance(count, bool)
+            or count < 0
+        ):
+            return None
+        total += count
+    return total
+
+
+def _validate_agenda_arm_evidence(
+    value: object,
+    *,
+    session_id: str,
+    launch: Mapping[str, object],
+) -> int:
+    """Validate one session's agenda-arm settlement evidence.
+
+    Returns the number of contributions the arm rejected, which the receipt's
+    contribution accounting needs: every contribution of a successful session is
+    either published or rejected with a recorded verdict, and a rejection is a
+    research event rather than a failure.
+    """
+
+    if type(value) is not dict:
+        _fail("MALFORMED_SESSION_RECEIPT", f"agenda_arm {session_id}")
+    arm = launch.get("agenda_arm")
+    launch_mode = arm.get("mode") if type(arm) is dict else None
+    reviewed = value.get("reviewed")
+    admitted = value.get("admitted")
+    rejected = value.get("rejected")
+    if (
+        value.get("schema") != _AGENDA_ARM_EVIDENCE_SCHEMA
+        or value.get("mode") not in _AGENDA_ARM_MODES
+        or value["mode"] != launch_mode
+        or type(reviewed) is not int
+        or isinstance(reviewed, bool)
+        or reviewed < 0
+        or type(admitted) is not int
+        or isinstance(admitted, bool)
+        or admitted < 0
+        or type(rejected) is not int
+        or isinstance(rejected, bool)
+        or rejected < 0
+        or admitted + rejected != reviewed
+        or len(canonical_json(value)) > MAXIMUM_AGENDA_ARM_EVIDENCE_BYTES
+    ):
+        _fail("MALFORMED_SESSION_RECEIPT", f"agenda_arm {session_id}")
+    if value["mode"] == "NOT_CONFIGURED":
+        if (
+            set(value) != _AGENDA_ARM_EVIDENCE_ABSENT_FIELDS
+            or value.get("arm") is not None
+            or value.get("arm_sha256") is not None
+            or reviewed != 0
+            or type(value.get("reason")) is not str
+        ):
+            _fail("MALFORMED_SESSION_RECEIPT", f"agenda_arm {session_id}")
+        return 0
+    if (
+        set(value) != _AGENDA_ARM_EVIDENCE_FIELDS
+        or value.get("arm") != (arm.get("arm") if type(arm) is dict else None)
+        or value.get("arm_sha256") != launch.get("agenda_arm_sha256")
+        or type(value.get("truncated")) is not bool
+        or type(value.get("publication_divergences")) is not int
+        or value["publication_divergences"] < 0  # type: ignore[operator]
+        or value.get("rejection_semantics")
+        != (arm.get("rejection_semantics") if type(arm) is dict else None)
+    ):
+        _fail("MALFORMED_SESSION_RECEIPT", f"agenda_arm binding {session_id}")
+    verdict_total = _agenda_counts(value.get("verdicts"), expected=None)
+    if verdict_total != reviewed:
+        _fail("MALFORMED_SESSION_RECEIPT", f"agenda_arm verdicts {session_id}")
+    for code in value["verdicts"]:  # type: ignore[index]
+        if _AGENDA_VERDICT_CODE.fullmatch(code) is None:
+            _fail("MALFORMED_SESSION_RECEIPT", f"agenda_arm verdicts {session_id}")
+    if _agenda_counts(value.get("instrument_attempts"), expected=None) is None:
+        _fail("MALFORMED_SESSION_RECEIPT", f"agenda_arm instruments {session_id}")
+    if _agenda_counts(value.get("records_by_schema"), expected=None) is None:
+        _fail("MALFORMED_SESSION_RECEIPT", f"agenda_arm records {session_id}")
+    if (
+        _agenda_counts(
+            value.get("route_declarations"), expected=_AGENDA_ARM_ROUTE_FIELDS
+        )
+        is None
+    ):
+        _fail("MALFORMED_SESSION_RECEIPT", f"agenda_arm route {session_id}")
+    _validate_agenda_lease_release(value.get("lease_release"), session_id=session_id)
+    _validate_agenda_clock(value.get("agenda_clock"), session_id=session_id)
+    decisions = value.get("decisions")
+    if (
+        type(decisions) is not list
+        or len(decisions) > MAXIMUM_AGENDA_ARM_DECISIONS
+        or (len(decisions) < reviewed and value["truncated"] is not True)
+        or len(decisions) > reviewed
+    ):
+        _fail("MALFORMED_SESSION_RECEIPT", f"agenda_arm decisions {session_id}")
+    for ordinal, row in enumerate(decisions, start=1):
+        if (
+            type(row) is not dict
+            or set(row) != _AGENDA_ARM_DECISION_FIELDS
+            or row.get("ordinal") != ordinal
+            or type(row.get("kind")) is not str
+            or type(row.get("code")) is not str
+            or _AGENDA_VERDICT_CODE.fullmatch(row["code"]) is None  # type: ignore[arg-type]
+            or type(row.get("admitted")) is not bool
+            or row["admitted"] is not (row["code"] == "ACCEPTED")
+            or type(row.get("detail")) is not str
+            or (
+                row.get("payload_schema") is not None
+                and type(row["payload_schema"]) is not str
+            )
+            or (
+                row.get("instrument") is not None
+                and type(row["instrument"]) is not str
+            )
+        ):
+            _fail(
+                "MALFORMED_SESSION_RECEIPT", f"agenda_arm decisions {session_id}"
+            )
+    return rejected
+
+
+def _validate_agenda_lease_release(value: object, *, session_id: str) -> None:
+    references = value.get("released_claim_refs") if type(value) is dict else None
+    released_at = value.get("released_at_tick") if type(value) is dict else None
+    if (
+        type(value) is not dict
+        or set(value) != {"authority", "released_claim_refs", "released_at_tick"}
+        or type(value.get("authority")) is not str
+        or not value["authority"]
+        or type(references) is not list
+        or len(references) > MAXIMUM_AGENDA_ARM_DECISIONS
+        or sorted(set(references)) != references
+        or not all(type(item) is str and item for item in references)
+        or (
+            released_at is not None
+            and (
+                type(released_at) is not int
+                or isinstance(released_at, bool)
+                or released_at < 0
+            )
+        )
+        or (references and released_at is None)
+    ):
+        _fail("MALFORMED_SESSION_RECEIPT", f"agenda_arm lease_release {session_id}")
+
+
+def _validate_agenda_clock(value: object, *, session_id: str) -> None:
+    if type(value) is not dict or set(value) != {
+        "semantics",
+        "base_tick",
+        "settled_tick",
+    }:
+        _fail("MALFORMED_SESSION_RECEIPT", f"agenda_arm clock {session_id}")
+    base = value.get("base_tick")
+    settled = value.get("settled_tick")
+    if (
+        type(value.get("semantics")) is not str
+        or not value["semantics"]
+        or type(base) is not int
+        or isinstance(base, bool)
+        or base < 0
+        or type(settled) is not int
+        or isinstance(settled, bool)
+        # The world's admission counter never runs backwards.
+        or settled < base
+    ):
+        _fail("MALFORMED_SESSION_RECEIPT", f"agenda_arm clock {session_id}")
 
 
 def _canonical_document(value: object, *, maximum_bytes: int) -> bytes:
@@ -928,6 +1250,7 @@ class RuntimeStore:
             "publication_sha256",
             "required_readiness_sha256",
             "verifier_kit_sha256",
+            "agenda_arm_sha256",
         ):
             digest = launch.get(label)
             if type(digest) is not str or _SHA256.fullmatch(digest) is None:
@@ -1082,6 +1405,7 @@ class RuntimeStore:
         ):
             _fail("MALFORMED_RUNTIME_LAUNCH", "context_window_policy")
         _validate_launch_verifier_kit(launch)
+        _validate_launch_agenda_arm(launch)
         if launch.get("host_policy") != runtime_host_policy_value():
             _fail("MALFORMED_RUNTIME_LAUNCH", "host_policy")
         readiness = launch.get("required_readiness")
@@ -1329,6 +1653,9 @@ class RuntimeStore:
         _validate_verifier_kit_evidence(
             value.get("verifier_kit"), session_id=session_id, launch=launch
         )
+        agenda_rejected = _validate_agenda_arm_evidence(
+            value.get("agenda_arm"), session_id=session_id, launch=launch
+        )
         context_window = value.get("context_window")
         launch_context = launch.get("context_window_policy")
         effective_tokens: object = None
@@ -1393,17 +1720,26 @@ class RuntimeStore:
                 and len(publications) != 0  # type: ignore[arg-type]
             )
             or (
-                (contribution_count is None and len(publications) != 0)  # type: ignore[arg-type]
+                (
+                    contribution_count is None
+                    and (len(publications) != 0 or agenda_rejected != 0)  # type: ignore[arg-type]
+                )
                 or (
                     type(contribution_count) is int
-                    and len(publications) > contribution_count  # type: ignore[arg-type]
+                    and len(publications) + agenda_rejected  # type: ignore[arg-type]
+                    > contribution_count
                 )
             )
             or (
                 status == "SUCCEEDED"
                 and (
                     type(contribution_count) is not int
-                    or len(publications) != contribution_count  # type: ignore[arg-type]
+                    # Every contribution of a successful session is accounted
+                    # for exactly once: either it was published, or the agenda
+                    # arm rejected it and recorded the verdict.  A rejection is
+                    # a research event, so it must not leave a hole here.
+                    or len(publications) + agenda_rejected  # type: ignore[arg-type]
+                    != contribution_count
                     or (
                         publication_mode == "DISABLED"
                         and contribution_count != 0

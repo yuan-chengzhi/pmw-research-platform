@@ -51,6 +51,10 @@ VERDICT_CODES = frozenset({
     "DECOMPOSITION_TARGET_UNKNOWN",
     "DECOMPOSITION_SUBLEMMA_UNKNOWN",
     "DECOMPOSITION_STATEMENT_MISMATCH",
+    # Route-telemetry rejections.  A route declaration that cites an admission
+    # the snapshot does not contain is refused rather than recorded, because an
+    # unresolvable citation measures nothing.
+    "ROUTE_TRIGGER_REF_UNKNOWN",
 })
 
 

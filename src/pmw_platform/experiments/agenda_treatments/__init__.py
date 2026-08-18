@@ -9,6 +9,10 @@ shapes and decision procedures three agenda treatments need, and nothing else:
   the rule that a primary action record cites a live directive.
 * **Adaptive arm** -- ``DecompositionRecord`` and the deterministic
   :func:`agenda_hardening_trigger`.
+* **Route telemetry (arm-independent)** -- ``RouteDeclaration``, whose peer
+  citations must resolve inside the snapshot.  It is not an instrument, grants
+  nothing and is legal under every arm, so route measurement does not vary with
+  the treatment.
 
 What this module deliberately does not do
 -----------------------------------------
@@ -41,6 +45,11 @@ from .central import (
     validate_directive,
     validate_directive_citation,
 )
+from .route import (
+    resolved_peer_trigger_refs,
+    route_declarations,
+    validate_route_declaration,
+)
 from .schemas import (
     AGENDA_TREATMENT_SCHEMAS,
     ARTIFACT_BACKED_CONTRACT_KINDS,
@@ -52,6 +61,7 @@ from .schemas import (
     OUTCOME_DISPOSITION_KIND,
     OUTCOME_DISPOSITIONS,
     PRIMARY_ACTION_KINDS,
+    ROUTE_DECLARATION_SCHEMA,
     TASK_ADMISSION_SCHEMA,
     TASK_CLAIM_SCHEMA,
     TASK_OUTCOME_SCHEMA,
@@ -63,6 +73,7 @@ from .schemas import (
     CompletionEvidence,
     DecompositionPayload,
     DirectivePayload,
+    RouteDeclarationPayload,
     Sublemma,
     TaskAdmissionPayload,
     TaskClaimPayload,
@@ -121,6 +132,7 @@ __all__ = [
     "OUTCOME_DISPOSITIONS",
     "OUTCOME_DISPOSITION_KIND",
     "PRIMARY_ACTION_KINDS",
+    "ROUTE_DECLARATION_SCHEMA",
     "TASK_ADMISSION_SCHEMA",
     "TASK_CLAIM_SCHEMA",
     "TASK_OUTCOME_SCHEMA",
@@ -139,6 +151,7 @@ __all__ = [
     "CompletionEvidence",
     "DecompositionPayload",
     "DirectivePayload",
+    "RouteDeclarationPayload",
     "Sublemma",
     "TaskAdmissionPayload",
     "TaskClaimPayload",
@@ -163,12 +176,15 @@ __all__ = [
     "reject",
     "reject_self_asserted_identity",
     "require_contribution",
+    "resolved_peer_trigger_refs",
+    "route_declarations",
     "settled_decomposition_refs",
     "superseded_directive_refs",
     "task_is_completed",
     "validate_decomposition",
     "validate_directive",
     "validate_directive_citation",
+    "validate_route_declaration",
     "validate_task_admission",
     "validate_task_claim",
     "validate_task_outcome",

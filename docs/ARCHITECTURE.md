@@ -278,7 +278,9 @@ schema migration.
   proven;
 - no automatic resume or reuse of a crashed/settled launch; cross-system
   publication gaps require explicit reconciliation;
-- no new M04/M05 treatment, ballot or all-agent barrier;
+- no new M04/M05 treatment, ballot or all-agent barrier; the agenda arm wired
+  in WP-D is an instrument exposure validated at publication time, and it
+  adds no ballot, no barrier and no host-side research control;
 - no claim that a verifier PASS proves novelty or solves an open problem.
 - launch identity binds the platform protocol, not an exact byte digest of the
   installed host package; archival reproduction must retain the repository

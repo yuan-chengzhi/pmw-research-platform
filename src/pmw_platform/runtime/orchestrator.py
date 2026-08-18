@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import Counter
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -16,7 +17,7 @@ import inspect
 import json
 import math
 from pathlib import Path
-from typing import Awaitable, Protocol, Sequence
+from typing import Awaitable, Mapping, Protocol, Sequence
 
 from ..sessions import SessionSpec, SessionStatus
 from ..verifier_kit import (
@@ -62,6 +63,17 @@ RUNTIME_INVOCATION_SCHEMA = "PMW_RUNTIME_SESSION_INVOCATION_1"
 RUNTIME_STATE_SCHEMA = "PMW_RUNTIME_SESSION_STATE_1"
 RUNTIME_RECEIPT_SCHEMA = "PMW_RUNTIME_SESSION_RECEIPT_1"
 RUNTIME_SETTLEMENT_SCHEMA = "PMW_RUNTIME_SETTLEMENT_1"
+
+# Agenda-arm vocabulary held as literals for the same reason the durable store
+# holds the verifier-kit vocabulary: an arm is an experiment, and the session
+# runtime must not import one to describe its own absence.  A test pins these
+# against the producing module's constants.
+AGENDA_ARM_LAUNCH_SCHEMA = "PMW_AGENDA_ARM_LAUNCH_1"
+AGENDA_ARM_ANNOUNCEMENT_SCHEMA = "PMW_AGENDA_ARM_1"
+AGENDA_ARM_EVIDENCE_SCHEMA = "PMW_AGENDA_ARM_SESSION_EVIDENCE_1"
+AGENDA_ARM_ENFORCEMENT_SCOPE = (
+    "PUBLICATION_TIME_RECORD_VALIDATION_ONLY_NO_RESEARCH_BEHAVIOUR_POLICING"
+)
 
 
 class RuntimeOrchestrationError(RuntimeError):
@@ -151,6 +163,86 @@ class ContributionPublisher(Protocol):
     ) -> object | Awaitable[object]: ...
 
 
+class AgendaArm(Protocol):
+    """An instrument exposure the host validates against at publication time.
+
+    The runtime deliberately holds only this protocol.  An arm is an
+    *experiment* -- it decides which record shapes a launch admits -- and the
+    session runtime must not depend on one, exactly as it does not depend on a
+    particular publisher.  Every method must be synchronous, bounded and free of
+    side effects outside the arm's own ledger.
+
+    A review that does not admit a contribution is a recorded research event.
+    The host skips that one publication, stamps the verdict into the session's
+    settlement evidence, and settles the session normally.
+    """
+
+    def launch_value(self) -> Mapping[str, object]: ...
+
+    def briefing_announcement(self) -> Mapping[str, object]: ...
+
+    def review(self, spec: SessionSpec, contribution: object) -> object: ...
+
+    def observe(
+        self,
+        spec: SessionSpec,
+        contribution: object,
+        result: object,
+    ) -> None: ...
+
+    def settle(self, spec: SessionSpec) -> object: ...
+
+    def session_evidence(self, spec: SessionSpec) -> Mapping[str, object]: ...
+
+
+def _arm_admits(decision: object) -> bool:
+    """Read one arm decision, refusing anything that is not an explicit bool."""
+
+    admitted = getattr(decision, "admitted", None)
+    if type(admitted) is not bool:
+        raise RuntimeOrchestrationError("AGENDA_ARM_DECISION_INVALID")
+    return admitted
+
+
+def not_configured_agenda_arm_launch_value() -> dict[str, object]:
+    """Return the exact launch block used when a launch configures no arm."""
+
+    return {
+        "schema": AGENDA_ARM_LAUNCH_SCHEMA,
+        "mode": "NOT_CONFIGURED",
+        "reason": "NO_AGENDA_ARM_CONFIGURED",
+        "enforcement": AGENDA_ARM_ENFORCEMENT_SCOPE,
+    }
+
+
+def absent_agenda_arm_announcement() -> dict[str, object]:
+    """Announce, on the same prompt surface, that no arm is configured."""
+
+    return {
+        "schema": AGENDA_ARM_ANNOUNCEMENT_SCHEMA,
+        "configured": False,
+        "statements": [
+            "This launch configures no agenda arm.",
+            "Records are published as written, with no instrument validation.",
+        ],
+    }
+
+
+def not_configured_agenda_arm_session_evidence() -> dict[str, object]:
+    """Return the receipt block used when a launch configured no arm."""
+
+    return {
+        "schema": AGENDA_ARM_EVIDENCE_SCHEMA,
+        "mode": "NOT_CONFIGURED",
+        "arm": None,
+        "arm_sha256": None,
+        "reviewed": 0,
+        "admitted": 0,
+        "rejected": 0,
+        "reason": "NO_AGENDA_ARM_CONFIGURED",
+    }
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -218,6 +310,7 @@ def build_launch_manifest(
     ),
     required_readiness: RequiredReadinessIdentity | None = None,
     verifier_kit: VerifierKit | None = None,
+    agenda_arm: AgendaArm | None = None,
 ) -> dict[str, object]:
     """Build the immutable execution identity, separate from the math plan."""
 
@@ -253,6 +346,7 @@ def build_launch_manifest(
         if verifier_kit is None
         else verifier_kit.launch_value()
     )
+    arm_value = _agenda_arm_launch_value(agenda_arm)
     session_ids = [item.session_id for item in prepared.plan.sessions]
     return {
         "schema": RUNTIME_LAUNCH_SCHEMA,
@@ -281,8 +375,23 @@ def build_launch_manifest(
         "verifier_kit_sha256": hashlib.sha256(
             canonical_json(kit_value)
         ).hexdigest(),
+        # The arm is execution identity, not mathematical identity: it says
+        # which instruments this launch exposes, never what the world means.
+        "agenda_arm": arm_value,
+        "agenda_arm_sha256": hashlib.sha256(
+            canonical_json(arm_value)
+        ).hexdigest(),
         "host_policy": runtime_host_policy_value(),
     }
+
+
+def _agenda_arm_launch_value(agenda_arm: AgendaArm | None) -> dict[str, object]:
+    if agenda_arm is None:
+        return not_configured_agenda_arm_launch_value()
+    value = agenda_arm.launch_value()
+    if type(value) is not dict:
+        raise RuntimeOrchestrationError("AGENDA_ARM_LAUNCH_INVALID")
+    return dict(value)
 
 
 class _Controller:
@@ -302,6 +411,7 @@ class _Controller:
         required_readiness: RequiredReadinessIdentity,
         resource_guard: ResourceGuard,
         verifier_kit: VerifierKit | None = None,
+        agenda_arm: AgendaArm | None = None,
     ) -> None:
         self.prepared = prepared
         self.backend = backend
@@ -316,6 +426,11 @@ class _Controller:
         self.required_readiness = required_readiness
         self.resource_guard = resource_guard
         self.verifier_kit = verifier_kit
+        self.agenda_arm = agenda_arm
+        # One arm ledger serves the whole cohort, and a publish may await, so
+        # review, publish and observe must not interleave across sessions: the
+        # world admits one record at a time and its tick counter says so.
+        self.agenda_lock = asyncio.Lock()
         self.stop_new = asyncio.Event()
         self.external_cancel = False
         self.unsafe = False
@@ -419,7 +534,35 @@ class _Controller:
                 if self.verifier_kit is None
                 else self.verifier_kit.briefing_announcement()
             ),
+            # The arm's instrument set is announced on the same authenticated
+            # surface, in the same non-prescriptive voice: what record shapes
+            # are legal and how claiming behaves, with no route and no ordering.
+            "agenda_arm": self._agenda_arm_announcement(),
         }
+
+    def _agenda_arm_announcement(self) -> dict[str, object]:
+        if self.agenda_arm is None:
+            return absent_agenda_arm_announcement()
+        value = self.agenda_arm.briefing_announcement()
+        if type(value) is not dict:
+            raise RuntimeOrchestrationError("AGENDA_ARM_ANNOUNCEMENT_INVALID")
+        return dict(value)
+
+    def _agenda_arm_evidence(self, spec: SessionSpec) -> dict[str, object]:
+        """Settle this session's leases, then read its arm evidence.
+
+        Releasing before reading is deliberate: the release is part of what the
+        receipt reports, and a settled session must not appear to still hold a
+        lease in the same document that records its settlement.
+        """
+
+        if self.agenda_arm is None:
+            return not_configured_agenda_arm_session_evidence()
+        self.agenda_arm.settle(spec)
+        value = self.agenda_arm.session_evidence(spec)
+        if type(value) is not dict:
+            raise RuntimeOrchestrationError("AGENDA_ARM_EVIDENCE_INVALID")
+        return dict(value)
 
     def _verifier_kit_evidence(self, spec: SessionSpec) -> dict[str, object]:
         if self.verifier_kit is None:
@@ -536,6 +679,10 @@ class _Controller:
                 else outcome.usage_evidence.to_value()
             ),
             "verifier_kit": self._verifier_kit_evidence(spec),
+            # Settlement evidence for the arm: which instruments this session
+            # used, every verdict it received, its route declarations and the
+            # leases its settlement released.
+            "agenda_arm": self._agenda_arm_evidence(spec),
             "context_window": {
                 "semantics": CONTEXT_WINDOW_SEMANTICS,
                 "configured_tokens": self.context_policy.for_session(
@@ -596,36 +743,60 @@ class _Controller:
         if self.publisher is None:
             raise RuntimeOrchestrationError("PMW_PUBLISH_UNAVAILABLE")
         published: list[object] = []
+        # Without an arm there is no shared ledger to protect, and the
+        # publication path stays exactly as it was.
+        serialize = (
+            self.agenda_lock if self.agenda_arm is not None else nullcontext()
+        )
         for contribution in outcome.contributions:
             try:
-                current_identity = getattr(self.publisher, "identity", None)
-                if (
-                    not isinstance(current_identity, PublicationIdentity)
-                    or current_identity.sha256
-                    != self.publication_identity.sha256
-                ):
-                    raise RuntimeOrchestrationError(
-                        "PUBLICATION_IDENTITY_DRIFT"
-                    )
-                result = self.publisher(spec, contribution)
-                if inspect.isawaitable(result):
-                    result = await result
-                published.append(_public_result(result))
-                current_identity = getattr(self.publisher, "identity", None)
-                if (
-                    not isinstance(current_identity, PublicationIdentity)
-                    or current_identity.sha256
-                    != self.publication_identity.sha256
-                ):
-                    raise RuntimeOrchestrationError(
-                        "PUBLICATION_IDENTITY_DRIFT"
-                    )
+                async with serialize:
+                    if not await self._admitted_by_arm(spec, contribution):
+                        # A rejected instrument is a research event, not an
+                        # apparatus failure: skip this one publication, keep the
+                        # verdict, and let the session settle normally.
+                        continue
+                    current_identity = getattr(self.publisher, "identity", None)
+                    if (
+                        not isinstance(current_identity, PublicationIdentity)
+                        or current_identity.sha256
+                        != self.publication_identity.sha256
+                    ):
+                        raise RuntimeOrchestrationError(
+                            "PUBLICATION_IDENTITY_DRIFT"
+                        )
+                    result = self.publisher(spec, contribution)
+                    if inspect.isawaitable(result):
+                        result = await result
+                    published.append(_public_result(result))
+                    if self.agenda_arm is not None:
+                        self.agenda_arm.observe(spec, contribution, result)
+                    current_identity = getattr(self.publisher, "identity", None)
+                    if (
+                        not isinstance(current_identity, PublicationIdentity)
+                        or current_identity.sha256
+                        != self.publication_identity.sha256
+                    ):
+                        raise RuntimeOrchestrationError(
+                            "PUBLICATION_IDENTITY_DRIFT"
+                        )
             except BaseException as error:
                 raise RuntimePublicationError(
                     _error_code(error, "PMW_PUBLISH_FAILED"),
                     tuple(published),
                 ) from error
         return tuple(published)
+
+    async def _admitted_by_arm(
+        self,
+        spec: SessionSpec,
+        contribution: ResearchContribution,
+    ) -> bool:
+        """Review one candidate against the arm and the then-current snapshot."""
+
+        if self.agenda_arm is None:
+            return True
+        return _arm_admits(self.agenda_arm.review(spec, contribution))
 
     async def _start(
         self,
@@ -1119,6 +1290,7 @@ async def run_prepared_cohort(
     publisher: ContributionPublisher | None = None,
     required_checkers: Sequence[RequiredReadinessChecker] = (),
     verifier_kit: VerifierKit | None = None,
+    agenda_arm: AgendaArm | None = None,
 ) -> RuntimeRunResult:
     """Run exactly the sessions frozen in one authenticated plan bundle."""
 
@@ -1138,6 +1310,17 @@ async def run_prepared_cohort(
         raise TypeError("required_checkers must be a sequence")
     if verifier_kit is not None and not isinstance(verifier_kit, VerifierKit):
         raise TypeError("verifier_kit must be VerifierKit")
+    if agenda_arm is not None:
+        for name in (
+            "launch_value",
+            "briefing_announcement",
+            "review",
+            "observe",
+            "settle",
+            "session_evidence",
+        ):
+            if not callable(getattr(agenda_arm, name, None)):
+                raise TypeError(f"agenda_arm must implement {name}()")
     identity = backend.identity
     if not isinstance(identity, BackendIdentity):
         raise TypeError("backend.identity must be BackendIdentity")
@@ -1206,6 +1389,7 @@ async def run_prepared_cohort(
             context_window_control,
             required_readiness,
             verifier_kit,
+            agenda_arm,
         )
         launch_sha256 = store.create_launch(
             launch,
@@ -1234,6 +1418,7 @@ async def run_prepared_cohort(
             required_readiness=required_readiness,
             resource_guard=resource_guard,
             verifier_kit=verifier_kit,
+            agenda_arm=agenda_arm,
         )
         controller._observe_resource_event(initial_resource_event)
         workers = tuple(
@@ -1314,6 +1499,7 @@ async def run_runtime_cohort(
     publisher: ContributionPublisher | None = None,
     required_checkers: Sequence[RequiredReadinessChecker] = (),
     verifier_kit: VerifierKit | None = None,
+    agenda_arm: AgendaArm | None = None,
     profiles_dir: str | Path | None = None,
     core_lock_path: str | Path | None = None,
 ) -> RuntimeRunResult:
@@ -1333,4 +1519,5 @@ async def run_runtime_cohort(
         publisher=publisher,
         required_checkers=required_checkers,
         verifier_kit=verifier_kit,
+        agenda_arm=agenda_arm,
     )

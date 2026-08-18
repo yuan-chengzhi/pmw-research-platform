@@ -175,8 +175,10 @@ def test_session_start_routes_authenticated_plan_backend_and_limits(
         publisher: object,
         required_checkers: object,
         verifier_kit: object,
+        agenda_arm: object,
     ) -> object:
         observed["run"] = (selected_prepared, selected_backend)
+        observed["agenda_arm"] = agenda_arm
         observed["limits"] = limits
         observed["context_policy"] = context_policy
         observed["publisher"] = publisher
@@ -235,6 +237,7 @@ def test_session_start_routes_authenticated_plan_backend_and_limits(
     assert observed["context_policy"].configured is False
     assert observed["publisher"] is None
     assert observed["verifier_kit"] is None
+    assert observed["agenda_arm"] is None
     assert emitted == [
         (
             {
@@ -246,6 +249,8 @@ def test_session_start_routes_authenticated_plan_backend_and_limits(
                 "counts": {outcome: 4},
                 "runtime_root": str(prepared.cohort_root / "runtime"),
                 "verifier_kit_sha256": None,
+                "agenda_arm": None,
+                "agenda_arm_sha256": None,
             },
             cli.sys.stdout,
         )
@@ -411,7 +416,9 @@ def test_session_start_routes_writer_authority_only_to_host_publisher(
         publisher: object,
         required_checkers: object,
         verifier_kit: object,
+        agenda_arm: object,
     ) -> object:
+        observed["agenda_arm"] = agenda_arm
         observed["backend"] = selected_backend
         observed["publisher"] = publisher
         observed["context_policy"] = context_policy

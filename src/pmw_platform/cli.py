@@ -28,6 +28,14 @@ from .config import (
     WorldRegistry,
     default_data_root,
 )
+from .experiments.agenda_arm import (
+    ALL_SESSIONS,
+    ARMS,
+    AgendaArm,
+    AgendaArmConfig,
+    AgendaArmError,
+    build_agenda_arm,
+)
 from .runtime.auth import RuntimeAuthenticationError, authenticate_plan_bundle
 from .runtime.command import CommandBackendError, load_command_backend
 from .runtime.orchestrator import (
@@ -487,6 +495,42 @@ def _runtime_verifier_kit(
     )
 
 
+def _runtime_agenda_arm(
+    args: argparse.Namespace, prepared: object
+) -> AgendaArm | None:
+    """Build this launch's agenda arm, reading the world's opening tick once.
+
+    No arm is the default.  It is not the P arm: P actively refuses typed
+    instruments, while an unconfigured launch validates nothing at all, and a
+    receipt must be able to say which of the two happened.
+    """
+
+    arm = getattr(args, "agenda_arm", None)
+    if arm is None:
+        return None
+    plan = prepared.plan  # type: ignore[attr-defined]
+    try:
+        config = AgendaArmConfig(
+            arm=arm,
+            coordinator_session_ids=tuple(args.agenda_coordinator),
+            admitting_slots=(
+                tuple(args.agenda_admitting_slot)
+                if args.agenda_admitting_slot
+                else ALL_SESSIONS
+            ),
+            # D is the arm whose contract says action is claimed through the
+            # worklist.  The flag is recorded, never enforced.
+            require_claim_for_primary_action=arm == "D",
+        )
+        return build_agenda_arm(
+            config,
+            session_ids=[spec.session_id for spec in plan.sessions],
+            world=prepared.world,  # type: ignore[attr-defined]
+        )
+    except AgendaArmError as error:
+        raise CommandLineError(f"agenda arm rejected: {error}") from error
+
+
 def _runtime_preflight_report(
     args: argparse.Namespace,
     prepared: object,
@@ -523,6 +567,7 @@ def _session_start(args: argparse.Namespace) -> int:
         _emit(report.to_value(), stream=sys.stderr)
         return 1
     verifier_kit = _runtime_verifier_kit(args, prepared)
+    agenda_arm = _runtime_agenda_arm(args, prepared)
     try:
         result = asyncio.run(
             _with_latched_sigint(
@@ -534,6 +579,7 @@ def _session_start(args: argparse.Namespace) -> int:
                     publisher=publisher,
                     required_checkers=checkers,
                     verifier_kit=verifier_kit,
+                    agenda_arm=agenda_arm,
                 )
             )
         )
@@ -558,6 +604,10 @@ def _session_start(args: argparse.Namespace) -> int:
         "runtime_root": str(prepared.cohort_root / "runtime"),
         "verifier_kit_sha256": (
             None if verifier_kit is None else verifier_kit.sha256
+        ),
+        "agenda_arm": None if agenda_arm is None else agenda_arm.arm,
+        "agenda_arm_sha256": (
+            None if agenda_arm is None else agenda_arm.sha256
         ),
     })
     return 0 if result.outcome == "SUCCEEDED" else 1
@@ -849,6 +899,35 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "do not materialize the read-only in-session verifier kit into "
             "each session workspace; host verification is unaffected"
+        ),
+    )
+    session_start.add_argument(
+        "--agenda-arm",
+        choices=ARMS,
+        help=(
+            "expose one agenda instrument set to this cohort: P advisory "
+            "only, D the open-admission worklist, A both, C coordinator "
+            "directives; omitted means no arm and no instrument validation"
+        ),
+    )
+    session_start.add_argument(
+        "--agenda-coordinator",
+        action="append",
+        default=[],
+        metavar="SESSION_ID",
+        help=(
+            "session slot allowed to issue directives under the C arm; "
+            "repeat for multiple slots"
+        ),
+    )
+    session_start.add_argument(
+        "--agenda-admitting-slot",
+        action="append",
+        default=[],
+        metavar="SESSION_ID",
+        help=(
+            "restrict worklist admission to these session slots; omitted "
+            "means open admission, which is what the D arm's contract says"
         ),
     )
     session_start.set_defaults(handler=_session_start)
