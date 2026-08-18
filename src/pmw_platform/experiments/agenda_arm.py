@@ -49,10 +49,16 @@ Lease lifecycle
 A holder's leases release when its session settles.  The lease holder is the
 bound ``session_id``, and a settled session can never write again, so its claims
 stop occupying their tasks at that moment.  Sessions outside this launch are
-already dead by construction -- session IDs are cohort-scoped and never reused
--- so they hold nothing.  TTL in admission ticks remains and guards within-life
-squatting only; the stalled-world caveat (a world with no activity never
-advances its clock) is accepted and documented.
+treated as dead: session IDs are cohort-scoped and never reused, so a session
+this launch does not run can never write again *provided no second launch is
+writing to the same world at the same time*.  Nothing in the platform enforces
+one live launch per world -- the runtime claim is per cohort, not per world --
+so concurrent cohorts on one world would make that assumption false, and this
+arm would then free a lease whose holder is still alive.
+
+TTL in admission ticks remains and guards within-life squatting only; the
+stalled-world caveat (a world with no activity never advances its clock) is
+accepted and documented.
 """
 
 from __future__ import annotations
@@ -82,6 +88,7 @@ from .agenda_treatments import (
     accept,
     blocking_claim_refs,
     payload_schema,
+    resolved_peer_trigger_refs,
     validate_decomposition,
     validate_directive,
     validate_directive_citation,
@@ -103,7 +110,6 @@ AGENDA_ARM_EVIDENCE_SCHEMA = "PMW_AGENDA_ARM_SESSION_EVIDENCE_1"
 
 ARM_MODE_ENFORCED = "ENFORCED"
 ARM_MODE_NOT_CONFIGURED = "NOT_CONFIGURED"
-ARM_MODES = frozenset({ARM_MODE_ENFORCED, ARM_MODE_NOT_CONFIGURED})
 
 #: The one arm-level rejection.  It is not a plugin verdict: the instrument was
 #: never evaluated, because this launch does not expose it at all.
@@ -256,10 +262,15 @@ class AgendaArmConfig:
         ):
             if type(getattr(self, label)) is not bool:
                 _fail("MALFORMED_AGENDA_ARM", label)
-        if self.enforce_directive_citation and DIRECTIVE not in self.instruments:
+        if DIRECTIVE not in self.instruments:
             # Requiring a citation to an instrument the arm does not expose
-            # would silence every primary action in the cohort.
-            _fail("MALFORMED_AGENDA_ARM", "enforce_directive_citation")
+            # would silence every primary action in the cohort, and a
+            # coordinator slot on an arm with no directive instrument is a
+            # frozen, permanently unusable authority assignment.
+            if self.enforce_directive_citation:
+                _fail("MALFORMED_AGENDA_ARM", "enforce_directive_citation")
+            if self.coordinator_session_ids:
+                _fail("MALFORMED_AGENDA_ARM", "coordinator_session_ids")
 
     @property
     def instruments(self) -> tuple[str, ...]:
@@ -581,13 +592,19 @@ class AgendaArm:
         self._snapshot: AgendaSnapshot | None = None
         self.roles = config.roles(
             session_ids,
-            world_session_ids=sorted(
-                {
-                    entry.session_id
-                    for entry in self.snapshot().entries
-                    if entry.session_id is not None
-                }
-                - self._session_ids
+            # Only open admission reaches past this launch, so only open
+            # admission pays for scanning the world's authors.
+            world_session_ids=(
+                sorted(
+                    {
+                        entry.session_id
+                        for entry in self.snapshot().entries
+                        if entry.session_id is not None
+                    }
+                    - self._session_ids
+                )
+                if config.open_admission
+                else ()
             ),
         )
         self._launch_value = config.launch_value()
@@ -617,7 +634,17 @@ class AgendaArm:
         return dict(self._launch_value)
 
     def admissions(self) -> tuple[tuple[str, object], ...]:
-        """Return this launch's admission-ordered ledger, for later analysis."""
+        """Return the ledger for later analysis: base prefix, then this launch.
+
+        Only the tail is admission-ordered.  The first :attr:`base_tick`
+        entries are the world as it stood at launch, in whatever order the
+        world adapter returned them (it sorts by admission ref), and their
+        individual admission indices are not recoverable from a snapshot.  An
+        analysis that walks this ledger must therefore skip that prefix by
+        passing ``base_count=arm.base_tick``, which
+        :func:`~pmw_platform.experiments.agenda_observables.trigger_time_series_from_arm`
+        does for the caller.
+        """
 
         return tuple(self._entries)
 
@@ -909,7 +936,9 @@ class AgendaArm:
     def _holder_is_released(self, holder_session_id: str) -> bool:
         if holder_session_id not in self._session_ids:
             # A session outside this launch can never write again: session IDs
-            # are cohort-scoped and are never reused.
+            # are cohort-scoped and are never reused.  See the module docstring
+            # for the one assumption this rests on -- that no second launch is
+            # writing to this world concurrently.
             return True
         return holder_session_id in self._settled
 
@@ -931,8 +960,12 @@ class AgendaArm:
         if decision.code == "ROUTE_TRIGGER_REF_UNKNOWN":
             ledger.bump("dangling_rejected")
         elif decision.admitted:
+            # Count what the plugin says resolves, rather than re-deriving it:
+            # an admitted declaration has every citation resolvable, and one
+            # rule with one implementation cannot drift from itself.
             ledger.bump(
-                "resolved_peer_trigger_refs", len(payload.peer_trigger_refs)
+                "resolved_peer_trigger_refs",
+                len(resolved_peer_trigger_refs(self.snapshot(), payload)),
             )
 
     def observe(

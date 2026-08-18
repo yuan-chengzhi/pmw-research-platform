@@ -93,8 +93,14 @@ def trigger_time_series(
 
     ``admissions`` is ``(admission_ref, content)`` in admission order; the first
     ``base_count`` entries are treated as already present and are collapsed into
-    the opening sample.  :meth:`AgendaArm.admissions` returns exactly this
-    ordering for a completed launch.
+    the opening sample.
+
+    ``base_count`` is not optional in practice.  A world snapshot does not
+    carry its own admission order, so the records that predate the observed
+    window have no recoverable individual index; walking them one at a time
+    would date them by an order that does not exist.  Pass
+    ``base_count=arm.base_tick`` for an :class:`AgendaArm` ledger, or use
+    :func:`trigger_time_series_from_arm`, which does it for you.
     """
 
     if isinstance(admissions, (str, bytes)) or not isinstance(
@@ -128,6 +134,28 @@ def trigger_time_series(
             )
         )
     return tuple(series)
+
+
+def trigger_time_series_from_arm(
+    arm: object,
+    target_ref: str,
+    *,
+    roles: AgendaRoles | None = None,
+) -> tuple[TriggerSample, ...]:
+    """Replay one completed launch's ledger, skipping its unordered prefix.
+
+    This is the intended entry point after a run: the arm knows both its own
+    admission order and where the pre-launch prefix ends, and it already holds
+    the resolved roles, so nothing about the reading has to be reconstructed by
+    hand.  It reads a finished ledger and cannot influence one.
+    """
+
+    return trigger_time_series(
+        arm.admissions(),  # type: ignore[attr-defined]
+        target_ref,
+        roles=arm.roles if roles is None else roles,  # type: ignore[attr-defined]
+        base_count=arm.base_tick,  # type: ignore[attr-defined]
+    )
 
 
 def trigger_time_series_from_world(

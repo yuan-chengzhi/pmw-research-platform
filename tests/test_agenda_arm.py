@@ -28,6 +28,7 @@ from pmw_platform.experiments.agenda_observables import (
     trigger_onset_tick,
     trigger_series_value,
     trigger_time_series,
+    trigger_time_series_from_arm,
     trigger_time_series_from_world,
 )
 from pmw_platform.experiments.agenda_treatments import (
@@ -56,6 +57,7 @@ from pmw_platform.runtime.contracts import (
 from pmw_platform.runtime.context import ContextWindowControl
 from pmw_platform.runtime.orchestrator import (
     RuntimeLimits,
+    RuntimeOrchestrationError,
     run_prepared_cohort,
 )
 from pmw_platform.runtime.publish import PublicationIdentity
@@ -416,6 +418,12 @@ def test_arm_configuration_rejects_unknown_arms_and_foreign_slots() -> None:
     with pytest.raises(AgendaArmError) as citation:
         AgendaArmConfig(arm="D", enforce_directive_citation=True)
     assert citation.value.code == "MALFORMED_AGENDA_ARM"
+
+    # A coordinator slot on an arm with no directive instrument would be a
+    # frozen, permanently unusable authority assignment.
+    with pytest.raises(AgendaArmError) as slot:
+        AgendaArmConfig(arm="A", coordinator_session_ids=("c-1",))
+    assert slot.value.code == "MALFORMED_AGENDA_ARM"
 
 
 def test_arm_verdict_codes_extend_the_plugin_vocabulary_by_exactly_one() -> None:
@@ -900,6 +908,31 @@ def test_settlement_is_idempotent_and_records_the_release_tick() -> None:
     assert evidence["agenda_clock"]["base_tick"] == 0
 
 
+def test_an_arm_that_misses_a_planned_session_is_rejected_read_only(
+    tmp_path: Path,
+) -> None:
+    """The rejection must land before any runtime exists.
+
+    An arm built for the wrong session set would otherwise raise while a
+    receipt is being assembled -- after the launch is durable and with no
+    settlement to fall back on.
+    """
+
+    prepared = _prepared(tmp_path, cohort_id="arm-mismatch", count=2)
+    publisher = _MemoryPublisher()
+    backend = _ScriptedBackend(lambda _session_id: ())
+    arm = AgendaArm(
+        AgendaArmConfig(arm="A"),
+        session_ids=["arm-mismatch-session-0001"],
+    )
+
+    with pytest.raises(RuntimeOrchestrationError) as caught:
+        _run(prepared, backend, publisher, arm)
+
+    assert caught.value.code == "AGENDA_ARM_SESSION_SET_MISMATCH"
+    assert not (prepared.cohort_root / "runtime").exists()
+
+
 def test_an_arm_refuses_a_session_outside_its_launch() -> None:
     arm = AgendaArm(AgendaArmConfig(arm="A"), session_ids=["c-1"])
     with pytest.raises(AgendaArmError) as caught:
@@ -1070,6 +1103,31 @@ def test_an_objection_unfires_the_trigger_and_the_series_says_so() -> None:
     assert reading["semantics"].startswith("STRUCTURAL_NOT_MATHEMATICAL")  # type: ignore[union-attr]
 
 
+def test_replaying_an_arm_ledger_skips_its_unordered_base_prefix() -> None:
+    """The base prefix is hash-ordered, so it must never be walked as time.
+
+    ``world.records()`` sorts by admission ref, so the pre-launch records in an
+    arm's ledger carry no recoverable admission order.  Walking them one at a
+    time invents ticks; the arm itself dates all of them at the opening tick.
+    """
+
+    rows, target_ref, roles = _trigger_fixture_world()
+    arm = AgendaArm(
+        AgendaArmConfig(arm="D", admitting_slots=("c-1",)),
+        session_ids=["c-1"],
+        base_records=list(rows),
+    )
+
+    replayed = trigger_time_series_from_arm(arm, target_ref, roles=roles)
+
+    assert [sample.tick for sample in replayed] == [arm.base_tick]
+    assert replayed[0].admission_ref is None
+    assert replayed[0].fired is True
+    # The naive call fabricates one tick per pre-launch record instead.
+    naive = trigger_time_series(arm.admissions(), target_ref, roles=roles)
+    assert [sample.tick for sample in naive] == [0, 1, 2, 3, 4]
+
+
 def test_the_trigger_series_can_walk_an_explicit_snapshot_sequence() -> None:
     rows, target_ref, roles = _trigger_fixture_world()
     snapshots = {
@@ -1154,6 +1212,25 @@ def test_the_store_refuses_receipt_evidence_bound_to_another_arm(
     forged_counts["agenda_arm"] = {**evidence, "rejected": 5}
     with pytest.raises(RuntimeStoreError):
         store.write_receipt("arm-tamper-session-0001", forged_counts)
+
+    # A rejection now excuses a missing publication, so an invented rejection
+    # must not close the accounting over a dropped record: the count has to be
+    # backed by verdicts that are actually rejections.
+    unbacked = dict(written)
+    unbacked["agenda_arm"] = {
+        **evidence,
+        "reviewed": 2,
+        "admitted": 1,
+        "rejected": 1,
+        "verdicts": {"ACCEPTED": 2},
+        "decisions": [
+            evidence["decisions"][0],  # type: ignore[index]
+            {**evidence["decisions"][0], "ordinal": 2},  # type: ignore[index]
+        ],
+    }
+    with pytest.raises(RuntimeStoreError) as unbacked_error:
+        store.write_receipt("arm-tamper-session-0001", unbacked)
+    assert unbacked_error.value.code == "MALFORMED_SESSION_RECEIPT"
 
     # The genuine receipt is still the one on disk.
     assert store.read_receipt("arm-tamper-session-0001") == written

@@ -26,7 +26,7 @@ src/pmw_platform/runtime/
 └── store.py                    # launch.agenda_arm 与 receipt.agenda_arm 的校验
 
 src/pmw_platform/cli.py         # session start --agenda-arm/--agenda-coordinator/--agenda-admitting-slot
-tests/test_agenda_arm.py        # 新：35 个测试（零模型、零网络、零子进程）
+tests/test_agenda_arm.py        # 新：37 个测试（零模型、零网络、零子进程）
 ```
 
 **依赖方向没有反转。** runtime 只持有一个 `AgendaArm` Protocol（与既有
@@ -41,7 +41,7 @@ vocabulary 字面量，不 import 生产者；`orchestrator.py` 同理持有「�
 |---|---|---|
 | Agenda arm | launch 冻结 arm 配置（`agenda_arm` + `agenda_arm_sha256`，P/D/A/C 四臂 = 工具集）；publish 路径按 arm 校验每条 contribution，verdict 进 receipt；invocation 面非规定性地公告工具集；agenda clock = 世界 admission 计数器；租约在持有者结算时自动释放 | 会话内 live 认领（无 live read plane）；`require_claim_for_primary_action` 的执行层（只记录不执行）；imposed-switch 臂；C 臂只做到「可用」，未做过实验 |
 | Route telemetry | typed `RouteDeclaration`（骑 ATTEMPT）：route 陈述、`peer_trigger_refs`（悬空即 fail-closed 拒绝）、`differentiation_note`；每 session 的解析计数进 settlement 证据 | 没有把 route 声明与实际发布记录做语义比对；「差异化」仍是自述 |
-| Agenda observable | host 侧 trigger 时间序列 + taskification/trigger 双 onset 摘要，可在一次 run 之后重放 | 序列只能由 admission-ordered ledger 或显式 snapshot 列表驱动；裸世界无法恢复 admission 顺序 |
+| Agenda observable | host 侧 trigger 时间序列 + taskification/trigger 双 onset 摘要，可在一次 run 之后用 `trigger_time_series_from_arm(arm, …)` 重放 | 序列只能由 admission-ordered ledger 或显式 snapshot 列表驱动；**裸世界无法恢复 admission 顺序**，账本的 base 前缀因此不可当时间轴（§9.15） |
 
 ## 3. arm 配置形状（D1）
 
@@ -110,9 +110,10 @@ arm.review(spec, contribution) → 不接纳则 continue（跳过这一条发布
 - **out-of-arm** 用 arm 层自己的码 `OUT_OF_ARM_INSTRUMENT`（`ARM_VERDICT_CODES` =
   WP-C 的 `VERDICT_CODES` ∪ 这一个）。含义与 plugin 的拒绝不同：这条仪器**根本没有被
   评估**，因为这次 launch 不暴露它。
-- 有 arm 时整个 review→publish→observe 序列由一把 `asyncio.Lock` 串行化（世界一次只
-  admit 一条记录，tick 计数器也这么说）；**没有 arm 时不取任何锁**（走 `nullcontext`），
-  发布并发行为与本 WP 之前完全一致。
+- 有 arm 时**每条 contribution** 的 review→publish→observe 三步由一把 `asyncio.Lock`
+  保成原子（世界一次只 admit 一条记录，tick 计数器也这么说）。注意锁**不是**按 session
+  批次加的，`settle()` 也在锁外：concurrency>1 时同代 peer 的记录会合法交错，后果见
+  §9.2。**没有 arm 时不取任何锁**（走 `nullcontext`），发布并发行为与本 WP 之前一致。
 - publication 被禁用（`PMW_PUBLISH_UNAVAILABLE`）时不做任何 review：没有发布路径就没有
   发布期校验。
 
@@ -175,10 +176,12 @@ tick 释放；`agenda_clock` 记录 `base_tick` 与 `settled_tick`。
 
 `experiments/agenda_observables.py`：
 
-- `trigger_time_series(admissions, target_ref, roles=…, base_count=…)` 在 admission
-  有序账本的每个前缀上求 `settled_decomposition_refs`，每个样本带
-  `tick / admission_ref / fired / decomposition_refs / admitted_task_count / proposal_count`；
-  `AgendaArm.admissions()` 正好给出这个顺序。
+- `trigger_time_series(admissions, target_ref, roles=…, base_count=…)` 在账本的每个
+  前缀上求 `settled_decomposition_refs`，每个样本带
+  `tick / admission_ref / fired / decomposition_refs / admitted_task_count / proposal_count`。
+  前 `base_count` 条被折进开局样本；**`base_count` 实际上不是可选的**（§9.15）。
+- `trigger_time_series_from_arm(arm, target_ref)` 是跑完一次 run 之后的正门：它自己传
+  `base_count=arm.base_tick` 与 `arm.roles`，因此不会把无序的 base 前缀当成时间轴。
 - `trigger_time_series_from_world(world, snapshot_refs, …)` 走显式快照序列，tick = 该
   快照的 admission 数（与账本形式一致）。调用方提供顺序：单个 snapshot ref 不携带自己的
   历史，本函数不臆造顺序。
@@ -191,9 +194,9 @@ tick 释放；`agenda_clock` 记录 `base_tick` 与 `settled_tick`。
 
 ## 8. 测试数字
 
-- 新增 `tests/test_agenda_arm.py`：**35 个测试**，零模型调用、零网络、零子进程。
-- 全量套件：**340 passed, 2 skipped**（本 WP 之前的基线 305 passed, 2 skipped；
-  新增 35，既有用例无一回归）。
+- 新增 `tests/test_agenda_arm.py`：**37 个测试**，零模型调用、零网络、零子进程。
+- 全量套件：**342 passed, 2 skipped**（本 WP 之前的基线 305 passed, 2 skipped；
+  新增 37，既有用例无一回归）。
 - `python -m compileall -q src tests` 通过（与 CI 一致）。
 - 覆盖：四臂各自的 mini-cohort run（P/D/A/C）+ 受限 admitting 槽位 + 未配置 arm；
   in-arm admission、out-of-arm 拒绝、同批次 claim 冲突、结算自动释放、跨生命 TTL 过期、
@@ -202,17 +205,25 @@ tick 释放；`agenda_clock` 记录 `base_tick` 与 `settled_tick`。
   digest 不一致时的 divergence 记账、C 臂 directive 引用强制、CLI `--agenda-arm` 路由、
   runtime 字面量与生产者常量相等、四 session 双并发下的账本隔离与单一 tick 计数器、
   以及 §9.3 那条「epoch = lifetime 下没人能关自己的租约」的结构性限制（用测试把它钉死，
-  而不是留在文档里）。
+  而不是留在文档里）。另有三条来自独立复查的加固：伪造 `rejected` 计数（decisions 全是
+  ACCEPTED）被 store 拒绝、arm 不覆盖 plan session 时在**建 launch 之前**只读拒绝、
+  账本 base 前缀不被当作时间轴。
 
 ## 9. 诚实未尽事项
 
 1. **D 与 A 在「合法记录集合」上目前无差别**（§3.2）。两臂的实验差异现在只落在
    arm 配置与 briefing 措辞上。要让 D 真的比 A 更紧，需要
    `require_claim_for_primary_action` 的执行层，那是被需求书排除的 non-goal。
-2. **会话内不可能有跨 session 的租约冲突。** epoch = lifetime：contribution 在结算时
-   才发布，而结算同时释放租约，所以同代 peer 之间的独占从来不会真正咬合。目前能观察到
-   的冲突只有「同一 session 自己这一批里的重复认领」。理论里那条**排他性把 OR 探索
-   串行化**的代价，在 live read plane 出现之前**测不到**——这是本 WP 最重要的一条限制。
+2. **跨 session 的租约冲突几乎测不到，且在并发下是调度依赖的。** epoch = lifetime：
+   contribution 在结算时才发布，而结算同时释放租约，所以 concurrency=1 时同代 peer 之间
+   的独占从来不会咬合，唯一能观察到的冲突是「同一 session 自己这一批里的重复认领」。
+   **concurrency>1 时并非绝无冲突**：锁是**每条 contribution** 而不是每个 session 批次，
+   `settle()` 也在锁外，所以持有者的 `_persist` 是否先跑完，决定了 peer 拿到 ACCEPTED
+   还是 `TASK_CLAIM_CONFLICT`——同一场景在同步 publisher 与会 await 的 publisher 下结论
+   不同。这不是实现 bug（两种读数都符合「结算即释放」），但**它意味着并发臂里的认领裁决
+   带调度噪声**，做实验时要么固定 concurrency=1，要么把这一项当作已知噪声源登记。
+   无论哪种，理论里那条**排他性把 OR 探索串行化**的代价在 live read plane 出现之前
+   **仍然测不到**——这是本 WP 最重要的一条限制。
 3. **`TaskRelease` / `TaskOutcome` 在 epoch = lifetime 下实际不可用**，这是上一条的
    结构性推论，必须单独记：一个 session 的记录在它结算时才被 admit，所以它**永远拿不到
    自己那条 claim 的 admission ref**，也就永远写不出关闭它的 outcome；同伴也不行——
@@ -235,6 +246,13 @@ tick 释放；`agenda_clock` 记录 `base_tick` 与 `settled_tick`。
 8. **`observe` 的分歧处理是记账而非阻断。** publisher 返回的 `content_sha256` 与 arm
    校验过的记录不一致时，该 admission 以**不透明条目**进账本（它满足不了任何 treatment
    规则），并在此后每份 receipt 的 `publication_divergences` 里累计。它**不会**中止 run。
+   连带后果要说清：不透明的 claim 也就**不再占用它的任务**，于是分歧之后 arm 可能对同一
+   任务再发一个租约——只有那个计数器记着这件事。真实 publisher 不会触发它
+   （`PmwContributionPublisher` 与 arm 走的是同一个 `contribution.bind(spec)`）。
+8b. **auto-release 之后，plugin 侧的事后审计一定会跟 host 不一致。** 世界里会同时存在
+   同一任务的两条未关闭 claim，`check_lease_exclusivity` 因此必然报 `TASK_CLAIM_CONFLICT`。
+   释放只存在于 host 证据里，世界内容中没有它的表示——审计者必须带着 receipt 的
+   `lease_release` 一起读，否则会得出「排他性被违反」的错误结论。
 9. **发布中途抛错的 session**（`RuntimePublicationError`）其 `reviewed` 可能大于
    `publications + rejected`：某条已判 ACCEPTED 但发布失败。仅出现在 FAILED 状态下，
    成功 session 的会计不变量不对该状态生效。
@@ -250,3 +268,17 @@ tick 释放；`agenda_clock` 记录 `base_tick` 与 `settled_tick`。
     仍是 Python 解析器与 `store.py` 的校验器。
 14. **零真实模型调用。** 没有任何模型见过这份工具集公告；「公告是否足够显著到让 agent
     真的去用某种仪器」仍是本装置要测的开放经验问题，本 WP 不作任何预言。
+15. **账本的 base 前缀没有 admission 顺序。** `world.records()` 按 admission ref 排序，
+    所以 `AgendaArm.admissions()` 只有**尾部**（本次 launch 自己发布的部分）是有序的；
+    前 `base_tick` 条的个体 index 无法从快照恢复。分析必须用
+    `trigger_time_series_from_arm(arm, …)`（自动传 `base_count=arm.base_tick`），
+    直接对整条账本调 `trigger_time_series` 会给史前记录编造 tick（有测试固定这个对比）。
+16. **`released_claim_refs` 被静默截断到 64 条**，`truncated` 标志只覆盖 `decisions`，
+    不覆盖它。单 session 的 contribution 上限也是 64，所以现实中不会触发。
+17. **store 无法校验 `arm` 取值属于 {P,D,A,C}**，也无法校验 `admitted_payload_schemas`
+    与 `instruments` 相符——这是「durable store 不 import 生产者」政策的代价，对持久记录
+    而言 `arm` 只是一个非空字符串。digest 绑定、字段集、计数闭合都是有校验的。
+18. **「不属于本次 launch 的 session 已死」依赖「同一世界同时只有一个 launch 在写」**，
+    而平台并不强制这一点（`RuntimeClaim` 是按 cohort 加锁，不是按 world）。两个 cohort
+    并发写同一个世界时，这条假设为假，arm 会释放一个持有者仍然活着的租约。操作纪律上
+    必须保证同一世界串行 launch。

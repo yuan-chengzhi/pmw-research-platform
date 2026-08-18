@@ -428,8 +428,11 @@ class _Controller:
         self.verifier_kit = verifier_kit
         self.agenda_arm = agenda_arm
         # One arm ledger serves the whole cohort, and a publish may await, so
-        # review, publish and observe must not interleave across sessions: the
-        # world admits one record at a time and its tick counter says so.
+        # each review/publish/observe triple is atomic: the world admits one
+        # record at a time and its tick counter says so.  The lock is *per
+        # contribution*, not per session: with concurrency above one, a peer's
+        # records can legitimately interleave with this session's, and whether
+        # a lease is still held then depends on which session settled first.
         self.agenda_lock = asyncio.Lock()
         self.stop_new = asyncio.Event()
         self.external_cancel = False
@@ -751,11 +754,10 @@ class _Controller:
         for contribution in outcome.contributions:
             try:
                 async with serialize:
-                    if not await self._admitted_by_arm(spec, contribution):
-                        # A rejected instrument is a research event, not an
-                        # apparatus failure: skip this one publication, keep the
-                        # verdict, and let the session settle normally.
-                        continue
+                    # Check drift before consulting the arm: a decision spent
+                    # on a record this host is about to refuse to publish would
+                    # sit in the evidence describing an admission that never
+                    # happened.
                     current_identity = getattr(self.publisher, "identity", None)
                     if (
                         not isinstance(current_identity, PublicationIdentity)
@@ -765,6 +767,11 @@ class _Controller:
                         raise RuntimeOrchestrationError(
                             "PUBLICATION_IDENTITY_DRIFT"
                         )
+                    if not self._admitted_by_arm(spec, contribution):
+                        # A rejected instrument is a research event, not an
+                        # apparatus failure: skip this one publication, keep the
+                        # verdict, and let the session settle normally.
+                        continue
                     result = self.publisher(spec, contribution)
                     if inspect.isawaitable(result):
                         result = await result
@@ -787,7 +794,7 @@ class _Controller:
                 ) from error
         return tuple(published)
 
-    async def _admitted_by_arm(
+    def _admitted_by_arm(
         self,
         spec: SessionSpec,
         contribution: ResearchContribution,
@@ -1321,6 +1328,17 @@ async def run_prepared_cohort(
         ):
             if not callable(getattr(agenda_arm, name, None)):
                 raise TypeError(f"agenda_arm must implement {name}()")
+        # An arm that does not cover every planned session would raise while
+        # a receipt is being built, i.e. after the launch exists and with no
+        # settlement to fall back on.  Prove coverage here instead, where the
+        # rejection is still read-only.
+        for spec in prepared.plan.sessions:
+            try:
+                agenda_arm.session_evidence(spec)
+            except Exception as error:
+                raise RuntimeOrchestrationError(
+                    "AGENDA_ARM_SESSION_SET_MISMATCH", spec.session_id
+                ) from error
     identity = backend.identity
     if not isinstance(identity, BackendIdentity):
         raise TypeError("backend.identity must be BackendIdentity")

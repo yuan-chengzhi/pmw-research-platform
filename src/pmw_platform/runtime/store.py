@@ -714,6 +714,7 @@ def _validate_agenda_arm_evidence(
             or value.get("arm_sha256") is not None
             or reviewed != 0
             or type(value.get("reason")) is not str
+            or not value["reason"]
         ):
             _fail("MALFORMED_SESSION_RECEIPT", f"agenda_arm {session_id}")
         return 0
@@ -734,6 +735,12 @@ def _validate_agenda_arm_evidence(
     for code in value["verdicts"]:  # type: ignore[index]
         if _AGENDA_VERDICT_CODE.fullmatch(code) is None:
             _fail("MALFORMED_SESSION_RECEIPT", f"agenda_arm verdicts {session_id}")
+    # A rejection now excuses a missing publication, so the rejection count
+    # must be backed by verdicts that are actually rejections.  Without this,
+    # an all-ACCEPTED decision list could carry an invented ``rejected`` and
+    # close the receipt's contribution accounting over a dropped record.
+    if value["verdicts"].get("ACCEPTED", 0) != admitted:  # type: ignore[union-attr]
+        _fail("MALFORMED_SESSION_RECEIPT", f"agenda_arm verdicts {session_id}")
     if _agenda_counts(value.get("instrument_attempts"), expected=None) is None:
         _fail("MALFORMED_SESSION_RECEIPT", f"agenda_arm instruments {session_id}")
     if _agenda_counts(value.get("records_by_schema"), expected=None) is None:
