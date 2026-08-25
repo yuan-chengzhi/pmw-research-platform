@@ -449,6 +449,58 @@ def test_backend_identity_drift_after_start_stops_returned_handle(
     )
 
 
+def test_host_wall_stop_preserves_finalized_backend_evidence_in_receipt(
+    tmp_path: Path,
+) -> None:
+    prepared = _prepared(
+        tmp_path,
+        cohort_id="cohort-wall-evidence",
+        count=1,
+        concurrency=1,
+    )
+    backend = _FakeBackend()
+    released = asyncio.Event()
+    outcome = BackendOutcome(
+        success=False,
+        terminal_reason="STOP_REQUESTED",
+        summary="observer finalized after host stop",
+        evidence={"observer_log": {"precommit": "bound"}},
+    )
+
+    class Handle:
+        async def wait(self):
+            await released.wait()
+            return outcome
+
+        async def stop(self, reason: str, grace_seconds: float):
+            del grace_seconds
+            released.set()
+            return StopProof(stopped=True, reason=reason)
+
+    async def start(_request):
+        return Handle()
+
+    backend.start = start  # type: ignore[method-assign]
+    result = asyncio.run(
+        run_prepared_cohort(
+            prepared,
+            backend,
+            limits=RuntimeLimits(
+                startup_seconds=1.0,
+                session_wall_seconds=0.02,
+                stop_grace_seconds=1.0,
+            ),
+        )
+    )
+
+    receipt = result.receipts[0]
+    assert receipt["status"] == "FAILED"
+    assert receipt["terminal_reason"] == "SESSION_WALL_LIMIT"
+    assert receipt["outcome"]["evidence"] == {  # type: ignore[index]
+        "observer_log": {"precommit": "bound"}
+    }
+
+
 def test_startup_timeout_stops_a_late_handle_after_cancel_is_swallowed(
     tmp_path: Path,
 ) -> None:

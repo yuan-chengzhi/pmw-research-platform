@@ -1161,6 +1161,20 @@ class _Controller:
                 proof = await self._stop(handle, reason)
                 wait_task.cancel()
                 await asyncio.gather(wait_task, return_exceptions=True)
+                stopped_outcome: BackendOutcome | None = None
+                if proof.stopped:
+                    try:
+                        selected_outcome = await asyncio.wait_for(
+                            handle.wait(),
+                            timeout=float(self.limits.stop_grace_seconds),
+                        )
+                        if isinstance(selected_outcome, BackendOutcome):
+                            stopped_outcome = selected_outcome
+                    except BaseException:
+                        # Host terminal classification below remains
+                        # authoritative.  A missing backend outcome merely
+                        # leaves its optional evidence unavailable.
+                        stopped_outcome = None
                 if not proof.stopped:
                     self.unsafe = True
                     self.stop_new.set()
@@ -1184,6 +1198,7 @@ class _Controller:
                     status=status,
                     terminal_reason=terminal_reason,
                     started_at=started_at,
+                    outcome=stopped_outcome,
                     stop_proof=proof,
                     error_code=error_code,
                 )
