@@ -176,13 +176,21 @@ class PiRpcFrameObservation:
 
 @dataclass(frozen=True, slots=True)
 class PiRpcObserverFinality:
-    """Typed terminal context delivered only after Pi process finality."""
+    """Typed terminal context delivered only after Pi process finality.
+
+    ``backend_outcome`` is the already bounded and schema-validated PMW
+    object.  It remains agent-authored candidate material, never proof
+    authority.  Supplying it after the stop proof lets a host observer perform
+    post-session verification before it freezes its evidence, without creating
+    a feedback/control channel into Pi.
+    """
 
     backend_success: bool
     terminal_reason: str
     stop_proof: StopProof
     observation_count: int
     transport_evidence: Mapping[str, object]
+    backend_outcome: BackendOutcome | None = None
 
 
 class PiRpcObserver(Protocol):
@@ -1463,6 +1471,7 @@ class _PiRpcTransport:
             stop_proof=proof,
             observation_count=self.observation_count,
             transport_evidence=self.evidence_value(),
+            backend_outcome=outcome,
         )
         await self._finalize_observer(finality=finality)
 

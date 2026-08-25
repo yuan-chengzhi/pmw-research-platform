@@ -1113,6 +1113,12 @@ def test_rpc_observer_identity_exact_total_order_and_final_evidence(
     assert observer.finality is not None
     assert observer.finality.backend_success is True
     assert observer.finality.terminal_reason == "RESEARCH_COMPLETED"
+    assert observer.finality.backend_outcome is not None
+    assert observer.finality.backend_outcome.success is True
+    assert observer.finality.backend_outcome.terminal_reason == "RESEARCH_COMPLETED"
+    # Finality sees the bounded agent outcome before observer evidence is
+    # merged; it cannot recursively authenticate its own return value.
+    assert "observer_log" not in observer.finality.backend_outcome.evidence
     assert observer.maximum_active_callbacks == 1
     assert [item.ordinal for item in observations] == list(
         range(1, len(observations) + 1)
@@ -1202,6 +1208,9 @@ def test_rpc_observer_callback_failure_fails_session_but_still_finalizes(
     assert observer.finality is not None
     assert observer.finality.backend_success is False
     assert observer.finality.terminal_reason == "PI_OBSERVER_FAILED"
+    assert observer.finality.backend_outcome is not None
+    assert observer.finality.backend_outcome.success is False
+    assert observer.finality.backend_outcome.terminal_reason == "PI_OBSERVER_FAILED"
     assert handle.transport.stop_proof is not None
     assert handle.transport.stop_proof.stopped is True
 
