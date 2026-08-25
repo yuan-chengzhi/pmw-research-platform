@@ -94,6 +94,16 @@ for raw in sys.stdin.buffer:
         }})
     elif kind == "prompt":
         response(kind, request_id)
+        if MODE == "partial-result-hang":
+            partial = {{
+                "schema": "PMW_RUNTIME_BACKEND_OUTCOME_1",
+                "evidence": {{"metron_candidate": {{"proof_source": "by exact True.intro"}}}},
+            }}
+            (Path.cwd() / "pi-result.json").write_text(
+                json.dumps(partial, separators=(",", ":"), sort_keys=True),
+                encoding="utf-8",
+            )
+            continue
         if MODE != "hang":
             outcome = {{
                 "schema": "PMW_RUNTIME_BACKEND_OUTCOME_1",
@@ -1155,6 +1165,43 @@ def test_rpc_observer_identity_exact_total_order_and_final_evidence(
     assert (request.evidence / "pi.frames.jsonl").read_bytes() == pi_frames
     assert handle.transport.stop_proof is not None
     assert handle.transport.stop_proof.stopped is True
+
+
+def test_rpc_observer_finality_retains_bounded_partial_result_after_host_stop(
+    tmp_path: Path,
+) -> None:
+    config_path, _agent_dir = _runtime_fixture(
+        tmp_path, mode="partial-result-hang"
+    )
+    factory = _RecordingPiObserverFactory()
+    backend = load_pi_backend(config_path, observer_factory=factory)
+    request = _request(tmp_path)
+
+    async def run():
+        handle = await backend.start(request)
+        result_path = request.workspace / "pi-result.json"
+        for _ in range(5_000):
+            if result_path.is_file():
+                break
+            await asyncio.sleep(0.001)
+        assert result_path.is_file()
+        proof = await handle.stop("SESSION_WALL_LIMIT", 1.0)
+        return proof, await handle.wait()
+
+    proof, outcome = asyncio.run(run())
+    assert proof.stopped is True
+    assert outcome.success is False
+    observer = factory.instances[0]
+    assert observer.finality is not None
+    raw = observer.finality.backend_result_file
+    assert raw is not None
+    assert json.loads(raw) == {
+        "schema": "PMW_RUNTIME_BACKEND_OUTCOME_1",
+        "evidence": {
+            "metron_candidate": {"proof_source": "by exact True.intro"}
+        },
+    }
+    assert observer.finality.backend_result_file_error is None
 
 
 def test_rpc_observer_agent_evidence_key_conflict_fails_closed(

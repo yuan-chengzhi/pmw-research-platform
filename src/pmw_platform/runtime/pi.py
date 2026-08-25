@@ -191,6 +191,8 @@ class PiRpcObserverFinality:
     observation_count: int
     transport_evidence: Mapping[str, object]
     backend_outcome: BackendOutcome | None = None
+    backend_result_file: bytes | None = None
+    backend_result_file_error: str | None = None
 
 
 class PiRpcObserver(Protocol):
@@ -1461,7 +1463,13 @@ class _PiRpcTransport:
                 raw,
             )
 
-    async def finalize_observer(self, outcome: BackendOutcome) -> None:
+    async def finalize_observer(
+        self,
+        outcome: BackendOutcome,
+        *,
+        backend_result_file: bytes | None = None,
+        backend_result_file_error: str | None = None,
+    ) -> None:
         proof = self.stop_proof
         if proof is None:
             raise AssertionError("observer finalization preceded transport stop proof")
@@ -1472,6 +1480,8 @@ class _PiRpcTransport:
             observation_count=self.observation_count,
             transport_evidence=self.evidence_value(),
             backend_outcome=outcome,
+            backend_result_file=backend_result_file,
+            backend_result_file_error=backend_result_file_error,
         )
         await self._finalize_observer(finality=finality)
 
@@ -2444,7 +2454,19 @@ class _RunningPiSession:
                 f"Pi RPC adapter failed: {type(error).__name__}",
                 proof,
             )
-        await self.transport.finalize_observer(outcome)
+        result_file: bytes | None = None
+        result_file_error: str | None = None
+        try:
+            result_file = _result_file(
+                self.result_path, self.config.maximum_result_bytes
+            )
+        except PiBackendError as error:
+            result_file_error = error.code
+        await self.transport.finalize_observer(
+            outcome,
+            backend_result_file=result_file,
+            backend_result_file_error=result_file_error,
+        )
         return self._merge_observer_evidence(outcome)
 
     async def _run(self) -> BackendOutcome:
