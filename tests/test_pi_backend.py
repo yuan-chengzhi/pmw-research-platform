@@ -21,6 +21,7 @@ from pmw_platform.runtime.pi import (
     PiBackendConfig,
     PiBackendError,
     PiRpcFrameObservation,
+    PiRpcObserverFinality,
     load_pi_backend,
     load_pi_backend_config,
 )
@@ -285,6 +286,7 @@ class _RecordingPiObserver:
         self.maximum_active_callbacks = 0
         self.finalize_calls = 0
         self.finalize_saw_finality = False
+        self.finality: PiRpcObserverFinality | None = None
         self.transport: pi_runtime._PiRpcTransport | None = None
         self.gate = asyncio.Event() if gate_first_observation else None
 
@@ -303,8 +305,11 @@ class _RecordingPiObserver:
         finally:
             self.active_callbacks -= 1
 
-    async def finalize(self) -> dict[str, object]:
+    async def finalize(
+        self, finality: PiRpcObserverFinality
+    ) -> dict[str, object]:
         self.finalize_calls += 1
+        self.finality = finality
         transport = self.transport
         if transport is not None:
             self.finalize_saw_finality = (
@@ -314,6 +319,8 @@ class _RecordingPiObserver:
                 and transport.stop_proof.stopped
                 and transport.frames.closed
                 and transport.stderr.closed
+                and finality.stop_proof == transport.stop_proof
+                and finality.observation_count == len(self.observations)
             )
         if self.fail_finalize:
             raise RuntimeError("injected finalizer failure")
@@ -1103,6 +1110,9 @@ def test_rpc_observer_identity_exact_total_order_and_final_evidence(
     }
     assert observer.finalize_calls == 1
     assert observer.finalize_saw_finality is True
+    assert observer.finality is not None
+    assert observer.finality.backend_success is True
+    assert observer.finality.terminal_reason == "RESEARCH_COMPLETED"
     assert observer.maximum_active_callbacks == 1
     assert [item.ordinal for item in observations] == list(
         range(1, len(observations) + 1)
@@ -1189,6 +1199,9 @@ def test_rpc_observer_callback_failure_fails_session_but_still_finalizes(
         "observed_frames": 2,
     }
     assert observer.finalize_calls == 1
+    assert observer.finality is not None
+    assert observer.finality.backend_success is False
+    assert observer.finality.terminal_reason == "PI_OBSERVER_FAILED"
     assert handle.transport.stop_proof is not None
     assert handle.transport.stop_proof.stopped is True
 

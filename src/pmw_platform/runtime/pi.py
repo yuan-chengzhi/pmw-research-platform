@@ -174,12 +174,25 @@ class PiRpcFrameObservation:
     monotonic_ns: int
 
 
+@dataclass(frozen=True, slots=True)
+class PiRpcObserverFinality:
+    """Typed terminal context delivered only after Pi process finality."""
+
+    backend_success: bool
+    terminal_reason: str
+    stop_proof: StopProof
+    observation_count: int
+    transport_evidence: Mapping[str, object]
+
+
 class PiRpcObserver(Protocol):
     """Host-owned sink for one Pi session's ordered transport frames."""
 
     async def observe(self, observation: PiRpcFrameObservation) -> None: ...
 
-    async def finalize(self) -> Mapping[str, object] | None: ...
+    async def finalize(
+        self, finality: PiRpcObserverFinality
+    ) -> Mapping[str, object] | None: ...
 
 
 class PiRpcObserverFactory(Protocol):
@@ -1440,12 +1453,27 @@ class _PiRpcTransport:
                 raw,
             )
 
-    async def _finalize_observer(self, *, process_stopped: bool) -> None:
+    async def finalize_observer(self, outcome: BackendOutcome) -> None:
+        proof = self.stop_proof
+        if proof is None:
+            raise AssertionError("observer finalization preceded transport stop proof")
+        finality = PiRpcObserverFinality(
+            backend_success=outcome.success,
+            terminal_reason=outcome.terminal_reason,
+            stop_proof=proof,
+            observation_count=self.observation_count,
+            transport_evidence=self.evidence_value(),
+        )
+        await self._finalize_observer(finality=finality)
+
+    async def _finalize_observer(
+        self, *, finality: PiRpcObserverFinality
+    ) -> None:
         if self.observer_finalized:
             return
         observer = self.observer
         assert observer is not None
-        if not process_stopped:
+        if not finality.stop_proof.stopped:
             self.observer_finalize_failure = PiRpcFailure(
                 "PI_OBSERVER_FINALITY_UNPROVEN"
             )
@@ -1453,7 +1481,7 @@ class _PiRpcTransport:
             return
         try:
             returned = await asyncio.wait_for(
-                observer.finalize(),
+                observer.finalize(finality),
                 timeout=float(self.config.response_timeout_seconds),
             )
             if returned is not None and not isinstance(returned, Mapping):
@@ -1707,7 +1735,6 @@ class _PiRpcTransport:
             )
             self._close_evidence()
             self.stop_proof = proof
-            await self._finalize_observer(process_stopped=True)
             return proof
 
         # Every phase is bounded.  The host deliberately joins this complete
@@ -1807,7 +1834,6 @@ class _PiRpcTransport:
         # Publish only after the finally block has drained and closed all
         # transport evidence.  This is the idempotent terminal boundary.
         self.stop_proof = proof
-        await self._finalize_observer(process_stopped=proof.stopped)
         return proof
 
     def _close_evidence(self) -> None:
@@ -2409,6 +2435,7 @@ class _RunningPiSession:
                 f"Pi RPC adapter failed: {type(error).__name__}",
                 proof,
             )
+        await self.transport.finalize_observer(outcome)
         return self._merge_observer_evidence(outcome)
 
     async def _run(self) -> BackendOutcome:
@@ -2969,6 +2996,7 @@ __all__ = [
     "PiBackendError",
     "PiRpcFailure",
     "PiRpcFrameObservation",
+    "PiRpcObserverFinality",
     "PiRpcObserver",
     "PiRpcObserverFactory",
     "load_pi_backend",
