@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import threading
+import time
 
 import pytest
 
@@ -103,6 +104,19 @@ for raw in sys.stdin.buffer:
                 json.dumps(partial, separators=(",", ":"), sort_keys=True),
                 encoding="utf-8",
             )
+            continue
+        if MODE == "observer-backlog-hang":
+            # More events than the adapter's bounded consumer queue.  The
+            # process deliberately remains in its prompt handler so a host
+            # stop races with a large stdout/observer backlog.
+            for index in range(1_400):
+                emit({{
+                    "type": "message_update",
+                    "assistantMessageEvent": {{
+                        "type": "text_delta",
+                        "delta": str(index % 10),
+                    }},
+                }})
             continue
         if MODE != "hang":
             outcome = {{
@@ -848,6 +862,131 @@ def test_stop_joins_completion_even_when_provider_emits_no_more_events(
     assert handle.completion.done()
     assert outcome.success is False
     assert outcome.terminal_reason == "STOP_REQUESTED"
+    assert pending == []
+
+
+def test_stop_is_bounded_with_a_synchronous_observer_backlog(
+    tmp_path: Path,
+) -> None:
+    config_path, _agent_dir = _runtime_fixture(
+        tmp_path, mode="observer-backlog-hang"
+    )
+
+    class SlowRecordingObserver(_RecordingPiObserver):
+        async def observe(self, observation: PiRpcFrameObservation) -> None:
+            # Reproduce a host observer whose durable callback blocks the event
+            # loop briefly.  Before the sticky reader-stop boundary, one
+            # cancellation/completion race let the reader drain until its
+            # 1,024-item event queue filled, leaving cleanup joined forever.
+            time.sleep(0.001)
+            await super().observe(observation)
+
+    class SlowRecordingFactory(_RecordingPiObserverFactory):
+        def create(self, request: SessionRequest) -> SlowRecordingObserver:
+            observer = SlowRecordingObserver(request)
+            self.instances.append(observer)
+            return observer
+
+    factory = SlowRecordingFactory()
+    backend = load_pi_backend(config_path, observer_factory=factory)
+    request = _request(tmp_path)
+
+    async def run():
+        handle = await backend.start(request)
+        observer = factory.instances[0]
+        deadline = asyncio.get_running_loop().time() + 3
+        while len(observer.observations) < 10:
+            if asyncio.get_running_loop().time() >= deadline:
+                raise AssertionError("fake Pi produced no observer backlog")
+            await asyncio.sleep(0.001)
+        started = asyncio.get_running_loop().time()
+        proof = await asyncio.wait_for(
+            handle.stop("SESSION_WALL_LIMIT", 0.4), timeout=3.0
+        )
+        elapsed = asyncio.get_running_loop().time() - started
+        outcome = await handle.wait()
+        pending = [
+            task
+            for task in asyncio.all_tasks()
+            if task is not asyncio.current_task()
+            and not task.done()
+            and task.get_name().startswith("test-s1:pi-")
+        ]
+        return handle, observer, proof, outcome, elapsed, pending
+
+    handle, observer, proof, outcome, elapsed, pending = asyncio.run(run())
+    assert proof.stopped is True
+    assert outcome.success is False
+    assert outcome.terminal_reason == "STOP_REQUESTED"
+    assert elapsed < 3.0
+    assert len(observer.observations) < 1_400
+    assert observer.finalize_calls == 1
+    assert handle.transport.reader_task is not None
+    assert handle.transport.reader_task.done()
+    assert handle.transport.stderr_task is not None
+    assert handle.transport.stderr_task.done()
+    assert handle.transport.frames.closed is True
+    assert handle.transport.stderr.closed is True
+    assert handle.completion.done()
+    assert pending == []
+
+
+def test_stop_joins_a_timed_out_observer_finalizer_without_orphaning_tasks(
+    tmp_path: Path,
+) -> None:
+    config_path, _agent_dir = _runtime_fixture(tmp_path, mode="hang")
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["limits"]["response_timeout_seconds"] = 1
+    config_path.write_bytes(canonical_json(config))
+
+    class BlockingFinalizer(_RecordingPiObserver):
+        async def finalize(self, finality: PiRpcObserverFinality):
+            self.finalize_calls += 1
+            self.finality = finality
+            await asyncio.Future()
+
+    class BlockingFinalizerFactory(_RecordingPiObserverFactory):
+        def create(self, request: SessionRequest) -> BlockingFinalizer:
+            observer = BlockingFinalizer(request)
+            self.instances.append(observer)
+            return observer
+
+    factory = BlockingFinalizerFactory()
+    backend = load_pi_backend(config_path, observer_factory=factory)
+    request = _request(tmp_path)
+
+    async def run():
+        handle = await backend.start(request)
+        deadline = asyncio.get_running_loop().time() + 3
+        while "prompt" not in _command_types(request):
+            if asyncio.get_running_loop().time() >= deadline:
+                raise AssertionError("fake Pi never received the prompt")
+            await asyncio.sleep(0.01)
+        started = asyncio.get_running_loop().time()
+        proof = await asyncio.wait_for(
+            handle.stop("SESSION_WALL_LIMIT", 0.4), timeout=3.0
+        )
+        elapsed = asyncio.get_running_loop().time() - started
+        outcome = await handle.wait()
+        pending = [
+            task
+            for task in asyncio.all_tasks()
+            if task is not asyncio.current_task() and not task.done()
+        ]
+        return handle, proof, outcome, elapsed, pending
+
+    handle, proof, outcome, elapsed, pending = asyncio.run(run())
+    assert proof.stopped is True
+    assert elapsed < 3.0
+    assert outcome.success is False
+    assert outcome.terminal_reason == "PI_OBSERVER_FINALIZE_FAILED"
+    assert factory.instances[0].finalize_calls == 1
+    assert handle.transport.observer_finalized is True
+    assert handle.transport.observer_finalize_failure is not None
+    assert handle.transport.observer_finalize_failure.code == (
+        "PI_OBSERVER_FINALIZE_FAILED"
+    )
+    assert handle.completion.done()
     assert pending == []
 
 

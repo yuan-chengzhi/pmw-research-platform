@@ -1388,6 +1388,13 @@ class _PiRpcTransport:
         self.shutdown_lock = asyncio.Lock()
         self.shutdown_task: asyncio.Task[StopProof] | None = None
         self.stop_proof: StopProof | None = None
+        # Set before the shutdown path joins the stdout reader.  ``Task.cancel``
+        # is not by itself a durable stop signal: cancellation can race with a
+        # just-completed ``wait_for(observer.observe(...))`` and be consumed
+        # while ``Task.cancelling()`` remains positive.  In that state the
+        # reader would otherwise keep draining buffered deltas and can block
+        # forever once ``event_queue`` fills after the session consumer stops.
+        self.reader_stop_requested = False
         self.descendant_groups: tuple[int, ...] = ()
         self.descendant_discovery_failure: str | None = None
         self._evidence_closed = False
@@ -1575,6 +1582,11 @@ class _PiRpcTransport:
         assert self.process is not None and self.process.stdout is not None
         try:
             while True:
+                current = asyncio.current_task()
+                if self.reader_stop_requested or (
+                    current is not None and current.cancelling()
+                ):
+                    return
                 try:
                     raw = await self.process.stdout.readline()
                 except ValueError as error:
@@ -1616,6 +1628,17 @@ class _PiRpcTransport:
                     if not future.done():
                         future.set_result(frame)
                 else:
+                    # A host stop ends the session event consumer.  Complete
+                    # the exact-frame observer callback already in progress,
+                    # but never enqueue another event behind that stopped
+                    # consumer.  This check also makes a cancellation request
+                    # sticky when asyncio's wait-for completion race consumed
+                    # its one CancelledError injection.
+                    current = asyncio.current_task()
+                    if self.reader_stop_requested or (
+                        current is not None and current.cancelling()
+                    ):
+                        return
                     await self.event_queue.put(frame)
         except asyncio.CancelledError:
             raise
@@ -1816,6 +1839,11 @@ class _PiRpcTransport:
                     detail="cooperative process-group cleanup raised an error",
                 )
         finally:
+            # Publish a sticky reader boundary before requesting task
+            # cancellation.  The reader checks it at safe frame boundaries,
+            # so one cancellation/completion race cannot turn shutdown into an
+            # unbounded drain of an observer backlog.
+            self.reader_stop_requested = True
             for task in (self.reader_task, self.stderr_task):
                 if task is not None and not task.done():
                     task.cancel()
