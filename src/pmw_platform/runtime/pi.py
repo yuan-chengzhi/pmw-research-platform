@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import base64
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -32,7 +33,8 @@ from pathlib import Path, PurePath
 import re
 import signal
 import stat
-from typing import Mapping, NoReturn
+import time
+from typing import Mapping, NoReturn, Protocol
 
 from .contracts import (
     BackendIdentity,
@@ -61,6 +63,8 @@ from ..world.records import canonical_json
 PI_BACKEND_CONFIG_SCHEMA = "PMW_PI_RPC_BACKEND_CONFIG_1"
 PI_BACKEND_PROTOCOL = "PMW_PI_RPC_1"
 PI_PROMPT_PROTOCOL = "PMW_PI_RESEARCH_PROMPT_1"
+PI_RPC_DIRECTION_HOST_TO_PI = "HOST_TO_PI"
+PI_RPC_DIRECTION_PI_TO_HOST = "PI_TO_HOST"
 
 MAXIMUM_CONFIG_BYTES = 262_144
 MAXIMUM_AUTH_BYTES = 1_048_576
@@ -75,6 +79,8 @@ MAXIMUM_PI_INSTALLATION_FILE_BYTES = MAXIMUM_PI_INSTALLATION_BYTES
 MAXIMUM_PI_INSTALLATION_ENTRIES = 50_000
 MAXIMUM_EXTENSIONS = 128
 MAXIMUM_TOOLS = 512
+MAXIMUM_PI_OBSERVER_EVIDENCE_KEYS = 128
+MAXIMUM_PI_OBSERVER_EVIDENCE_BYTES = 1_048_576
 _MAXIMUM_JSON_INTEGER = (1 << 63) - 1
 _EVENT_QUEUE_CAPACITY = 1_024
 
@@ -151,6 +157,48 @@ _ENVELOPE_BEGIN = "PMW_BACKEND_OUTCOME_JSON_BEGIN\n"
 _ENVELOPE_END = "\nPMW_BACKEND_OUTCOME_JSON_END"
 
 
+@dataclass(frozen=True, slots=True)
+class PiRpcFrameObservation:
+    """One immutable host observation of an exact LF-delimited RPC frame.
+
+    ``ordinal`` is total across both directions for one Pi session.  It and
+    both clocks are assigned while the transport's single observation lock is
+    held.  The observer never participates in frame parsing or correlation and
+    has no return channel through which it could replace transport bytes.
+    """
+
+    direction: str
+    raw_lf_json: bytes
+    ordinal: int
+    observed_at: str
+    monotonic_ns: int
+
+
+class PiRpcObserver(Protocol):
+    """Host-owned sink for one Pi session's ordered transport frames."""
+
+    async def observe(self, observation: PiRpcFrameObservation) -> None: ...
+
+    async def finalize(self) -> Mapping[str, object] | None: ...
+
+
+class PiRpcObserverFactory(Protocol):
+    """Create session-local observers under one public launch identity.
+
+    ``identity`` uses the existing bounded, secret-rejecting public identity
+    contract.  ``evidence_keys`` must be a sorted, unique tuple and is bound
+    into the Pi backend identity before any session starts.
+    """
+
+    @property
+    def identity(self) -> BackendIdentity: ...
+
+    @property
+    def evidence_keys(self) -> tuple[str, ...]: ...
+
+    def create(self, request: SessionRequest) -> PiRpcObserver: ...
+
+
 class PiBackendError(ValueError):
     """A stable configuration, transport, or result-validation failure."""
 
@@ -167,6 +215,32 @@ class PiRpcFailure(RuntimeError):
         self.code = code
         self.detail = detail[:2_000]
         super().__init__(f"{code}: {self.detail}" if self.detail else code)
+
+
+def _observer_factory_contract(
+    factory: PiRpcObserverFactory,
+) -> tuple[BackendIdentity, tuple[str, ...]]:
+    try:
+        identity = factory.identity
+        evidence_keys = factory.evidence_keys
+    except Exception as error:  # noqa: BLE001
+        raise PiBackendError(
+            "PI_OBSERVER_FACTORY_INVALID", "identity unavailable"
+        ) from error
+    if not isinstance(identity, BackendIdentity):
+        raise PiBackendError("PI_OBSERVER_FACTORY_INVALID", "identity")
+    if (
+        not isinstance(evidence_keys, tuple)
+        or len(evidence_keys) > MAXIMUM_PI_OBSERVER_EVIDENCE_KEYS
+        or any(
+            type(key) is not str or _RESULT_COMPONENT.fullmatch(key) is None
+            for key in evidence_keys
+        )
+        or evidence_keys != tuple(sorted(set(evidence_keys)))
+        or "pi_rpc" in evidence_keys
+    ):
+        raise PiBackendError("PI_OBSERVER_FACTORY_INVALID", "evidence_keys")
+    return identity, evidence_keys
 
 
 def _fail(code: str, detail: str = "") -> NoReturn:
@@ -1241,11 +1315,15 @@ class _PiRpcTransport:
         request: SessionRequest,
         argv: tuple[str, ...],
         environment: Mapping[str, str],
+        observer: PiRpcObserver | None = None,
+        observer_evidence_keys: tuple[str, ...] = (),
     ) -> None:
         self.config = config
         self.request = request
         self.argv = argv
         self.environment = dict(environment)
+        self.observer = observer
+        self.observer_evidence_keys = observer_evidence_keys
         self.process: asyncio.subprocess.Process | None = None
         self.process_group_id: int | None = None
         self.frames = _BoundedEvidence(
@@ -1275,6 +1353,11 @@ class _PiRpcTransport:
         self.failure: PiRpcFailure | None = None
         self.failure_event = asyncio.Event()
         self.send_lock = asyncio.Lock()
+        self.observation_lock = asyncio.Lock()
+        self.observation_count = 0
+        self.observer_evidence: dict[str, object] = {}
+        self.observer_finalize_failure: PiRpcFailure | None = None
+        self.observer_finalized = observer is None
         self.request_count = 0
         self.frame_count = 0
         self.reader_task: asyncio.Task[None] | None = None
@@ -1285,6 +1368,127 @@ class _PiRpcTransport:
         self.descendant_groups: tuple[int, ...] = ()
         self.descendant_discovery_failure: str | None = None
         self._evidence_closed = False
+
+    def install_observer(self, observer: PiRpcObserver) -> None:
+        if self.process is not None or self.observer is not None:
+            raise PiBackendError("PI_OBSERVER_FACTORY_FAILED", "late observer")
+        self.observer = observer
+        self.observer_finalized = False
+
+    async def _observe_frame(self, direction: str, raw: bytes) -> None:
+        if self.observer is None:
+            return
+        async with self.observation_lock:
+            await self._observe_frame_locked(direction, raw)
+
+    async def _observe_frame_locked(self, direction: str, raw: bytes) -> None:
+        observer = self.observer
+        assert observer is not None
+        if direction not in {
+            PI_RPC_DIRECTION_HOST_TO_PI,
+            PI_RPC_DIRECTION_PI_TO_HOST,
+        }:
+            raise AssertionError("invalid Pi RPC observation direction")
+        self.observation_count += 1
+        observation = PiRpcFrameObservation(
+            direction=direction,
+            raw_lf_json=bytes(raw),
+            ordinal=self.observation_count,
+            observed_at=datetime.now(timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z"),
+            monotonic_ns=time.monotonic_ns(),
+        )
+        try:
+            returned = await asyncio.wait_for(
+                observer.observe(observation),
+                timeout=float(self.config.response_timeout_seconds),
+            )
+        except asyncio.CancelledError as error:
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                raise
+            raise PiRpcFailure(
+                "PI_OBSERVER_FAILED", "CancelledError"
+            ) from error
+        except Exception as error:  # noqa: BLE001
+            raise PiRpcFailure(
+                "PI_OBSERVER_FAILED", type(error).__name__
+            ) from error
+        if returned is not None:
+            raise PiRpcFailure("PI_OBSERVER_FAILED", "non-null return")
+
+    async def _write_host_frame(
+        self,
+        raw: bytes,
+        *,
+        timeout: float,
+    ) -> None:
+        assert self.process is not None and self.process.stdin is not None
+        if self.observer is None:
+            self.process.stdin.write(raw)
+            await asyncio.wait_for(self.process.stdin.drain(), timeout=timeout)
+            return
+        # Keep the actual write/drain and its observation in the same lock.
+        # A response may already be readable immediately after ``drain``;
+        # the stdout reader must nevertheless receive the next ordinal.
+        async with self.observation_lock:
+            self.process.stdin.write(raw)
+            await asyncio.wait_for(self.process.stdin.drain(), timeout=timeout)
+            await self._observe_frame_locked(
+                PI_RPC_DIRECTION_HOST_TO_PI,
+                raw,
+            )
+
+    async def _finalize_observer(self, *, process_stopped: bool) -> None:
+        if self.observer_finalized:
+            return
+        observer = self.observer
+        assert observer is not None
+        if not process_stopped:
+            self.observer_finalize_failure = PiRpcFailure(
+                "PI_OBSERVER_FINALITY_UNPROVEN"
+            )
+            self.observer_finalized = True
+            return
+        try:
+            returned = await asyncio.wait_for(
+                observer.finalize(),
+                timeout=float(self.config.response_timeout_seconds),
+            )
+            if returned is not None and not isinstance(returned, Mapping):
+                raise PiRpcFailure(
+                    "PI_OBSERVER_FINALIZE_FAILED", "evidence must be an object"
+                )
+            selected = {} if returned is None else dict(returned)
+            keys = set(selected)
+            if not keys.issubset(self.observer_evidence_keys):
+                raise PiRpcFailure(
+                    "PI_OBSERVER_FINALIZE_FAILED", "undeclared evidence key"
+                )
+            cloned = _bounded_json_clone(
+                selected,
+                maximum_bytes=MAXIMUM_PI_OBSERVER_EVIDENCE_BYTES,
+                label="Pi observer evidence",
+            )
+            if type(cloned) is not dict:
+                raise AssertionError("observer evidence clone is not an object")
+            self.observer_evidence = cloned
+        except asyncio.CancelledError as error:
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                raise
+            self.observer_finalize_failure = PiRpcFailure(
+                "PI_OBSERVER_FINALIZE_FAILED", "CancelledError"
+            )
+        except PiRpcFailure as error:
+            self.observer_finalize_failure = error
+        except Exception as error:  # noqa: BLE001
+            self.observer_finalize_failure = PiRpcFailure(
+                "PI_OBSERVER_FINALIZE_FAILED", type(error).__name__
+            )
+        finally:
+            self.observer_finalized = True
 
     async def spawn(self) -> None:
         try:
@@ -1333,10 +1537,6 @@ class _PiRpcTransport:
                         "RPC_EOF", f"returncode={self.process.returncode}"
                     )
                 self.frames.append(raw)
-                if self.frames.write_failed:
-                    raise PiRpcFailure("RPC_EVIDENCE_WRITE_FAILED")
-                if self.frames.cap_exceeded:
-                    raise PiRpcFailure("RPC_STDOUT_LIMIT")
                 if (
                     not raw.endswith(b"\n")
                     or raw.endswith(b"\r\n")
@@ -1344,6 +1544,14 @@ class _PiRpcTransport:
                     or len(raw) > self.config.maximum_jsonl_line_bytes
                 ):
                     raise PiRpcFailure("RPC_MALFORMED_FRAME")
+                await self._observe_frame(
+                    PI_RPC_DIRECTION_PI_TO_HOST,
+                    raw,
+                )
+                if self.frames.write_failed:
+                    raise PiRpcFailure("RPC_EVIDENCE_WRITE_FAILED")
+                if self.frames.cap_exceeded:
+                    raise PiRpcFailure("RPC_STDOUT_LIMIT")
                 self.frame_count += 1
                 if self.frame_count > self.config.maximum_frame_count:
                     raise PiRpcFailure("RPC_FRAME_LIMIT")
@@ -1416,13 +1624,20 @@ class _PiRpcTransport:
                 asyncio.get_running_loop().create_future()
             )
             self.pending[request_id] = (command, future)
+            raw = canonical_json(request) + b"\n"
             try:
-                self.process.stdin.write(canonical_json(request) + b"\n")
-                await asyncio.wait_for(
-                    self.process.stdin.drain(), timeout=selected_timeout
+                await self._write_host_frame(
+                    raw,
+                    timeout=selected_timeout,
                 )
+            except PiRpcFailure as error:
+                self.pending.pop(request_id, None)
+                future.cancel()
+                self._set_failure(error)
+                raise
             except (TimeoutError, BrokenPipeError, ConnectionError) as error:
                 self.pending.pop(request_id, None)
+                future.cancel()
                 raise PiRpcFailure("RPC_WRITE_FAILED", command) from error
         try:
             return await asyncio.wait_for(future, timeout=selected_timeout)
@@ -1492,6 +1707,7 @@ class _PiRpcTransport:
             )
             self._close_evidence()
             self.stop_proof = proof
+            await self._finalize_observer(process_stopped=True)
             return proof
 
         # Every phase is bounded.  The host deliberately joins this complete
@@ -1591,6 +1807,7 @@ class _PiRpcTransport:
         # Publish only after the finally block has drained and closed all
         # transport evidence.  This is the idempotent terminal boundary.
         self.stop_proof = proof
+        await self._finalize_observer(process_stopped=proof.stopped)
         return proof
 
     def _close_evidence(self) -> None:
@@ -1605,7 +1822,7 @@ class _PiRpcTransport:
         self._evidence_closed = True
 
     def evidence_value(self) -> dict[str, object]:
-        return {
+        value: dict[str, object] = {
             "protocol": PI_BACKEND_PROTOCOL,
             "single_stdout_reader": True,
             "strict_lf_jsonl": True,
@@ -1621,6 +1838,17 @@ class _PiRpcTransport:
                 None if self.stop_proof is None else self.stop_proof.to_value()
             ),
         }
+        if self.observer is not None:
+            value["transport_observer"] = {
+                "observation_count": self.observation_count,
+                "finalized": self.observer_finalized,
+                "finalize_failure": (
+                    None
+                    if self.observer_finalize_failure is None
+                    else self.observer_finalize_failure.code
+                ),
+            }
+        return value
 
     @property
     def evidence_write_failed(self) -> bool:
@@ -2155,7 +2383,7 @@ class _RunningPiSession:
 
     async def _run_guarded(self) -> BackendOutcome:
         try:
-            return await self._run()
+            outcome = await self._run()
         except asyncio.CancelledError:
             await asyncio.shield(
                 self.transport.shutdown(
@@ -2176,11 +2404,12 @@ class _RunningPiSession:
                 code = "PROCESS_GROUP_CLEANUP_FAILED"
             elif self.transport.evidence_write_failed:
                 code = "RPC_EVIDENCE_WRITE_FAILED"
-            return self._failure(
+            outcome = self._failure(
                 code,
                 f"Pi RPC adapter failed: {type(error).__name__}",
                 proof,
             )
+        return self._merge_observer_evidence(outcome)
 
     async def _run(self) -> BackendOutcome:
         state_before = _response_data(
@@ -2273,6 +2502,12 @@ class _RunningPiSession:
         reported = _parse_result(raw_result)
         if "pi_rpc" in reported.evidence:
             raise PiBackendError("PI_RESULT_INVALID", "reserved evidence key")
+        if set(reported.evidence).intersection(
+            self.transport.observer_evidence_keys
+        ):
+            raise PiBackendError(
+                "PI_RESULT_INVALID", "reserved observer evidence key"
+            )
         if "pi_rpc" in reported.usage:
             raise PiBackendError("PI_RESULT_INVALID", "reserved usage key")
 
@@ -2351,6 +2586,52 @@ class _RunningPiSession:
             evidence=evidence,
             usage_evidence=self.usage.evidence(),
         )
+
+    def _merge_observer_evidence(
+        self,
+        outcome: BackendOutcome,
+    ) -> BackendOutcome:
+        if self.transport.observer is None:
+            return outcome
+        proof = self.transport.stop_proof
+        if proof is None:
+            raise AssertionError("observer settlement preceded transport shutdown")
+        failure = self.transport.observer_finalize_failure
+        if failure is not None:
+            reason = (
+                "PROCESS_GROUP_CLEANUP_FAILED"
+                if failure.code == "PI_OBSERVER_FINALITY_UNPROVEN"
+                else "PI_OBSERVER_FINALIZE_FAILED"
+            )
+            return self._failure(
+                reason,
+                "Pi RPC transport observer could not be finalized",
+                proof,
+            )
+        evidence = outcome.evidence
+        if set(evidence).intersection(self.transport.observer_evidence):
+            return self._failure(
+                "PI_OBSERVER_FINALIZE_FAILED",
+                "Pi RPC transport observer evidence key conflict",
+                proof,
+            )
+        evidence.update(self.transport.observer_evidence)
+        try:
+            return BackendOutcome(
+                success=outcome.success,
+                terminal_reason=outcome.terminal_reason,
+                summary=outcome.summary,
+                contributions=outcome.contributions,
+                usage=outcome.usage,
+                evidence=evidence,
+                usage_evidence=outcome.usage_evidence,
+            )
+        except RuntimeContractError:
+            return self._failure(
+                "PI_OBSERVER_FINALIZE_FAILED",
+                "Pi RPC transport observer evidence was not admissible",
+                proof,
+            )
 
     def _runtime_evidence(self, proof: StopProof) -> dict[str, object]:
         value = self.transport.evidence_value()
@@ -2448,14 +2729,44 @@ async def _shutdown_despite_cancellation(
 class PiBackend:
     """Run one generic research prompt through Pi's account-OAuth RPC mode."""
 
-    def __init__(self, config: PiBackendConfig) -> None:
+    def __init__(
+        self,
+        config: PiBackendConfig,
+        *,
+        observer_factory: PiRpcObserverFactory | None = None,
+    ) -> None:
         if not isinstance(config, PiBackendConfig):
             raise TypeError("config must be PiBackendConfig")
         self._config = config
+        self._observer_factory = observer_factory
+        self._observer_identity: BackendIdentity | None = None
+        self._observer_evidence_keys: tuple[str, ...] = ()
+        public_config = config.to_public_value()
+        if observer_factory is not None:
+            observer_identity, evidence_keys = _observer_factory_contract(
+                observer_factory
+            )
+            self._observer_identity = observer_identity
+            self._observer_evidence_keys = evidence_keys
+            public_config["transport_observer"] = {
+                "factory_identity": observer_identity.to_value(),
+                "evidence_keys": list(evidence_keys),
+                "frame_contract": {
+                    "directions": [
+                        PI_RPC_DIRECTION_HOST_TO_PI,
+                        PI_RPC_DIRECTION_PI_TO_HOST,
+                    ],
+                    "bytes": "EXACT_LF_JSON",
+                    "ordering": "HOST_TOTAL_ORDINAL_SINGLE_LOCK",
+                    "clocks": ["UTC_OBSERVED_AT", "HOST_MONOTONIC_NS"],
+                    "observer_can_replace_frame": False,
+                    "observer_failure": "SESSION_FAIL_CLOSED",
+                },
+            }
         self._identity = BackendIdentity(
             name=config.name,
             protocol=PI_BACKEND_PROTOCOL,
-            public_config=config.to_public_value(),
+            public_config=public_config,
         )
         self._verification_lock = asyncio.Lock()
 
@@ -2471,6 +2782,33 @@ class PiBackend:
         """Recheck every pinned runtime input without starting Pi."""
 
         self._config.verify_runtime()
+        if self._observer_factory is not None:
+            identity, evidence_keys = _observer_factory_contract(
+                self._observer_factory
+            )
+            if (
+                identity != self._observer_identity
+                or evidence_keys != self._observer_evidence_keys
+            ):
+                _fail("PI_OBSERVER_FACTORY_DRIFT")
+
+    def _create_observer(self, request: SessionRequest) -> PiRpcObserver | None:
+        factory = self._observer_factory
+        if factory is None:
+            return None
+        try:
+            observer = factory.create(request)
+        except Exception as error:  # noqa: BLE001
+            raise PiBackendError(
+                "PI_OBSERVER_FACTORY_FAILED", type(error).__name__
+            ) from error
+        if (
+            observer is None
+            or not callable(getattr(observer, "observe", None))
+            or not callable(getattr(observer, "finalize", None))
+        ):
+            raise PiBackendError("PI_OBSERVER_FACTORY_FAILED", "observer")
+        return observer
 
     def validate_context_window_policy(
         self,
@@ -2520,7 +2858,11 @@ class PiBackend:
                 request=request,
                 argv=argv,
                 environment=environment,
+                observer_evidence_keys=self._observer_evidence_keys,
             )
+            observer = self._create_observer(request)
+            if observer is not None:
+                transport.install_observer(observer)
             spawn_task = asyncio.create_task(transport.spawn())
             await asyncio.shield(spawn_task)
             spawn_task = None
@@ -2554,12 +2896,18 @@ class PiBackend:
                 )
             else:
                 if transport is not None:
-                    transport._close_evidence()
-                proof = StopProof(
-                    stopped=True,
-                    reason="START_CANCELLED",
-                    detail="no Pi process was created",
-                )
+                    proof, _repeated_cancel = await _shutdown_despite_cancellation(
+                        transport,
+                        reason="START_CANCELLED",
+                        grace_seconds=float(request.stop_grace_seconds),
+                        abort_first=False,
+                    )
+                else:
+                    proof = StopProof(
+                        stopped=True,
+                        reason="START_CANCELLED",
+                        detail="no Pi process was created",
+                    )
             raise BackendStartError(
                 "PI_START_CANCELLED", stop_proof=proof
             ) from cancelled
@@ -2579,12 +2927,17 @@ class PiBackend:
                     ) from cleanup_cancel
             else:
                 if transport is not None:
-                    transport._close_evidence()
-                proof = StopProof(
-                    stopped=True,
-                    reason="START_FAILED",
-                    detail="no Pi process was created",
-                )
+                    proof = await transport.shutdown(
+                        reason="START_FAILED",
+                        grace_seconds=float(request.stop_grace_seconds),
+                        abort_first=False,
+                    )
+                else:
+                    proof = StopProof(
+                        stopped=True,
+                        reason="START_FAILED",
+                        detail="no Pi process was created",
+                    )
             raise BackendStartError(
                 "PI_START_FAILED",
                 type(error).__name__,
@@ -2592,20 +2945,32 @@ class PiBackend:
             ) from error
 
 
-def load_pi_backend(path: Path) -> PiBackend:
+def load_pi_backend(
+    path: Path,
+    *,
+    observer_factory: PiRpcObserverFactory | None = None,
+) -> PiBackend:
     """Construct a Pi backend from one strict JSON configuration."""
 
-    return PiBackend(load_pi_backend_config(path))
+    return PiBackend(
+        load_pi_backend_config(path),
+        observer_factory=observer_factory,
+    )
 
 
 __all__ = [
     "PI_BACKEND_CONFIG_SCHEMA",
     "PI_BACKEND_PROTOCOL",
     "PI_PROMPT_PROTOCOL",
+    "PI_RPC_DIRECTION_HOST_TO_PI",
+    "PI_RPC_DIRECTION_PI_TO_HOST",
     "PiBackend",
     "PiBackendConfig",
     "PiBackendError",
     "PiRpcFailure",
+    "PiRpcFrameObservation",
+    "PiRpcObserver",
+    "PiRpcObserverFactory",
     "load_pi_backend",
     "load_pi_backend_config",
 ]

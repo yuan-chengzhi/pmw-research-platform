@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 import json
 import os
 from pathlib import Path
@@ -9,12 +10,18 @@ import threading
 import pytest
 
 import pmw_platform.runtime.pi as pi_runtime
-from pmw_platform.runtime.contracts import BackendStartError, SessionRequest
+from pmw_platform.runtime.contracts import (
+    BackendIdentity,
+    BackendStartError,
+    SessionRequest,
+)
 from pmw_platform.runtime.pi import (
     PI_BACKEND_CONFIG_SCHEMA,
     PiBackend,
     PiBackendConfig,
     PiBackendError,
+    PiRpcFrameObservation,
+    load_pi_backend,
     load_pi_backend_config,
 )
 from pmw_platform.sessions import SessionSpec
@@ -93,7 +100,11 @@ for raw in sys.stdin.buffer:
                 "terminal_reason": "RESEARCH_COMPLETED",
                 "summary": "fake research completed",
                 "usage": {{}},
-                "evidence": {{}},
+                "evidence": (
+                    {{"observer_log": {{"agent": "must-not-own"}}}}
+                    if MODE == "agent-observer-evidence"
+                    else {{}}
+                ),
                 "contributions": [],
             }}
             encoded = json.dumps(outcome, ensure_ascii=False, allow_nan=False, separators=(",", ":"), sort_keys=True)
@@ -255,6 +266,94 @@ async def _wait_fake_pid(request: SessionRequest) -> int:
         if asyncio.get_running_loop().time() >= deadline:
             raise AssertionError("fake Pi did not publish a complete pid")
         await asyncio.sleep(0.01)
+
+
+class _RecordingPiObserver:
+    def __init__(
+        self,
+        request: SessionRequest,
+        *,
+        fail_at_ordinal: int | None = None,
+        fail_finalize: bool = False,
+        gate_first_observation: bool = False,
+    ) -> None:
+        self.request = request
+        self.fail_at_ordinal = fail_at_ordinal
+        self.fail_finalize = fail_finalize
+        self.observations: list[PiRpcFrameObservation] = []
+        self.active_callbacks = 0
+        self.maximum_active_callbacks = 0
+        self.finalize_calls = 0
+        self.finalize_saw_finality = False
+        self.transport: pi_runtime._PiRpcTransport | None = None
+        self.gate = asyncio.Event() if gate_first_observation else None
+
+    async def observe(self, observation: PiRpcFrameObservation) -> None:
+        if self.gate is not None and not self.observations:
+            await self.gate.wait()
+        self.active_callbacks += 1
+        self.maximum_active_callbacks = max(
+            self.maximum_active_callbacks, self.active_callbacks
+        )
+        try:
+            await asyncio.sleep(0)
+            self.observations.append(observation)
+            if observation.ordinal == self.fail_at_ordinal:
+                raise RuntimeError("injected observer failure")
+        finally:
+            self.active_callbacks -= 1
+
+    async def finalize(self) -> dict[str, object]:
+        self.finalize_calls += 1
+        transport = self.transport
+        if transport is not None:
+            self.finalize_saw_finality = (
+                transport.process is not None
+                and transport.process.returncode is not None
+                and transport.stop_proof is not None
+                and transport.stop_proof.stopped
+                and transport.frames.closed
+                and transport.stderr.closed
+            )
+        if self.fail_finalize:
+            raise RuntimeError("injected finalizer failure")
+        return {
+            "observer_log": {
+                "finalize_calls": self.finalize_calls,
+                "observed_frames": len(self.observations),
+            }
+        }
+
+
+class _RecordingPiObserverFactory:
+    def __init__(
+        self,
+        *,
+        fail_at_ordinal: int | None = None,
+        fail_finalize: bool = False,
+        gate_first_observation: bool = False,
+        evidence_keys: tuple[str, ...] = ("observer_log",),
+    ) -> None:
+        self.identity = BackendIdentity(
+            name="test-pi-rpc-observer",
+            protocol="TEST_PI_RPC_OBSERVER_1",
+            public_config={"implementation": "zero-provider-test", "revision": 1},
+        )
+        self.evidence_keys = evidence_keys
+        self.fail_at_ordinal = fail_at_ordinal
+        self.fail_finalize = fail_finalize
+        self.gate_first_observation = gate_first_observation
+        self.instances: list[_RecordingPiObserver] = []
+
+    def create(self, request: SessionRequest) -> _RecordingPiObserver:
+        observer = _RecordingPiObserver(
+            request,
+            fail_at_ordinal=self.fail_at_ordinal,
+            fail_finalize=self.fail_finalize,
+            gate_first_observation=self.gate_first_observation,
+        )
+        self.instances.append(observer)
+        return observer
 
 
 def test_config_is_strict_json_and_public_identity_redacts_oauth(tmp_path: Path) -> None:
@@ -963,3 +1062,213 @@ def test_evidence_close_failure_cannot_return_success(
     assert outcome.evidence["pi_rpc"]["stop_proof"]["stopped"] is True
     assert handle.transport.frames.closed is True
     assert handle.transport.evidence_write_failed is True
+
+
+def test_rpc_observer_identity_exact_total_order_and_final_evidence(
+    tmp_path: Path,
+) -> None:
+    config_path, _agent_dir = _runtime_fixture(tmp_path)
+    factory = _RecordingPiObserverFactory(gate_first_observation=True)
+    backend = load_pi_backend(config_path, observer_factory=factory)
+    request = _request(tmp_path)
+
+    observer_identity = backend.identity.public_config["transport_observer"]
+    assert observer_identity == {
+        "factory_identity": factory.identity.to_value(),
+        "evidence_keys": ["observer_log"],
+        "frame_contract": {
+            "directions": ["HOST_TO_PI", "PI_TO_HOST"],
+            "bytes": "EXACT_LF_JSON",
+            "ordering": "HOST_TOTAL_ORDINAL_SINGLE_LOCK",
+            "clocks": ["UTC_OBSERVED_AT", "HOST_MONOTONIC_NS"],
+            "observer_can_replace_frame": False,
+            "observer_failure": "SESSION_FAIL_CLOSED",
+        },
+    }
+
+    async def run():
+        handle = await backend.start(request)
+        observer = factory.instances[0]
+        observer.transport = handle.transport
+        assert observer.gate is not None
+        observer.gate.set()
+        return handle, observer, await handle.wait()
+
+    handle, observer, outcome = asyncio.run(run())
+    observations = observer.observations
+    assert outcome.success is True
+    assert outcome.evidence["observer_log"] == {
+        "finalize_calls": 1,
+        "observed_frames": len(observations),
+    }
+    assert observer.finalize_calls == 1
+    assert observer.finalize_saw_finality is True
+    assert observer.maximum_active_callbacks == 1
+    assert [item.ordinal for item in observations] == list(
+        range(1, len(observations) + 1)
+    )
+    assert [item.direction for item in observations] == [
+        "HOST_TO_PI",
+        "PI_TO_HOST",
+        "HOST_TO_PI",
+        "PI_TO_HOST",
+        "PI_TO_HOST",
+        "PI_TO_HOST",
+        "HOST_TO_PI",
+        "PI_TO_HOST",
+        "HOST_TO_PI",
+        "PI_TO_HOST",
+    ]
+    for item in observations:
+        assert item.raw_lf_json.endswith(b"\n")
+        assert b"\r" not in item.raw_lf_json
+        value = json.loads(item.raw_lf_json)
+        assert canonical_json(value) + b"\n" == item.raw_lf_json
+        observed_at = datetime.fromisoformat(
+            item.observed_at.replace("Z", "+00:00")
+        )
+        assert observed_at.utcoffset() is not None
+    assert [item.monotonic_ns for item in observations] == sorted(
+        item.monotonic_ns for item in observations
+    )
+    pi_frames = b"".join(
+        item.raw_lf_json
+        for item in observations
+        if item.direction == "PI_TO_HOST"
+    )
+    assert (request.evidence / "pi.frames.jsonl").read_bytes() == pi_frames
+    assert handle.transport.stop_proof is not None
+    assert handle.transport.stop_proof.stopped is True
+
+
+def test_rpc_observer_agent_evidence_key_conflict_fails_closed(
+    tmp_path: Path,
+) -> None:
+    config_path, _agent_dir = _runtime_fixture(
+        tmp_path, mode="agent-observer-evidence"
+    )
+    factory = _RecordingPiObserverFactory()
+    backend = PiBackend(
+        load_pi_backend_config(config_path), observer_factory=factory
+    )
+    request = _request(tmp_path)
+
+    async def run():
+        handle = await backend.start(request)
+        return handle, await handle.wait()
+
+    handle, outcome = asyncio.run(run())
+    assert outcome.success is False
+    assert outcome.terminal_reason == "PI_RESULT_INVALID"
+    assert outcome.evidence["observer_log"]["finalize_calls"] == 1
+    assert outcome.evidence["observer_log"].get("agent") is None
+    assert handle.transport.stop_proof is not None
+    assert handle.transport.stop_proof.stopped is True
+
+
+def test_rpc_observer_callback_failure_fails_session_but_still_finalizes(
+    tmp_path: Path,
+) -> None:
+    config_path, _agent_dir = _runtime_fixture(tmp_path)
+    factory = _RecordingPiObserverFactory(fail_at_ordinal=2)
+    backend = PiBackend(
+        load_pi_backend_config(config_path), observer_factory=factory
+    )
+    request = _request(tmp_path)
+
+    async def run():
+        handle = await backend.start(request)
+        return handle, await handle.wait()
+
+    handle, outcome = asyncio.run(run())
+    observer = factory.instances[0]
+    assert outcome.success is False
+    assert outcome.terminal_reason == "PI_OBSERVER_FAILED"
+    assert outcome.evidence["observer_log"] == {
+        "finalize_calls": 1,
+        "observed_frames": 2,
+    }
+    assert observer.finalize_calls == 1
+    assert handle.transport.stop_proof is not None
+    assert handle.transport.stop_proof.stopped is True
+
+
+def test_rpc_observer_finalize_failure_is_an_explicit_backend_failure(
+    tmp_path: Path,
+) -> None:
+    config_path, _agent_dir = _runtime_fixture(tmp_path)
+    factory = _RecordingPiObserverFactory(fail_finalize=True)
+    backend = PiBackend(
+        load_pi_backend_config(config_path), observer_factory=factory
+    )
+    request = _request(tmp_path)
+
+    async def run():
+        handle = await backend.start(request)
+        return handle, await handle.wait()
+
+    handle, outcome = asyncio.run(run())
+    assert outcome.success is False
+    assert outcome.terminal_reason == "PI_OBSERVER_FINALIZE_FAILED"
+    observer_status = outcome.evidence["pi_rpc"]["transport_observer"]
+    assert observer_status == {
+        "observation_count": 10,
+        "finalized": True,
+        "finalize_failure": "PI_OBSERVER_FINALIZE_FAILED",
+    }
+    assert "observer_log" not in outcome.evidence
+    assert handle.transport.stop_proof is not None
+    assert handle.transport.stop_proof.stopped is True
+
+
+def test_pi_backend_without_observer_preserves_public_identity(tmp_path: Path) -> None:
+    config_path, _agent_dir = _runtime_fixture(tmp_path)
+    config = load_pi_backend_config(config_path)
+
+    assert load_pi_backend(config_path).identity == PiBackend(config).identity
+    assert "transport_observer" not in PiBackend(config).identity.public_config
+
+
+def test_rpc_observer_factory_identity_drift_is_rejected(tmp_path: Path) -> None:
+    config_path, _agent_dir = _runtime_fixture(tmp_path)
+    factory = _RecordingPiObserverFactory()
+    backend = PiBackend(
+        load_pi_backend_config(config_path), observer_factory=factory
+    )
+    factory.identity = BackendIdentity(
+        name="test-pi-rpc-observer",
+        protocol="TEST_PI_RPC_OBSERVER_1",
+        public_config={"implementation": "zero-provider-test", "revision": 2},
+    )
+
+    with pytest.raises(PiBackendError) as raised:
+        backend.verify_runtime()
+    assert raised.value.code == "PI_OBSERVER_FACTORY_DRIFT"
+
+
+def test_rpc_observer_rejects_reserved_or_undeclared_evidence_keys(
+    tmp_path: Path,
+) -> None:
+    config_path, _agent_dir = _runtime_fixture(tmp_path)
+    config = load_pi_backend_config(config_path)
+
+    with pytest.raises(PiBackendError) as raised:
+        PiBackend(
+            config,
+            observer_factory=_RecordingPiObserverFactory(
+                evidence_keys=("pi_rpc",)
+            ),
+        )
+    assert raised.value.code == "PI_OBSERVER_FACTORY_INVALID"
+
+    factory = _RecordingPiObserverFactory(evidence_keys=())
+    backend = PiBackend(config, observer_factory=factory)
+    request = _request(tmp_path)
+
+    async def run():
+        handle = await backend.start(request)
+        return await handle.wait()
+
+    outcome = asyncio.run(run())
+    assert outcome.success is False
+    assert outcome.terminal_reason == "PI_OBSERVER_FINALIZE_FAILED"
