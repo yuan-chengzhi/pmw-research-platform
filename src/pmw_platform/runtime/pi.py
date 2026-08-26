@@ -81,6 +81,12 @@ MAXIMUM_EXTENSIONS = 128
 MAXIMUM_TOOLS = 512
 MAXIMUM_PI_OBSERVER_EVIDENCE_KEYS = 128
 MAXIMUM_PI_OBSERVER_EVIDENCE_BYTES = 1_048_576
+MAXIMUM_PI_TOOL_CHANNEL_ENVIRONMENT_KEYS = 32
+MAXIMUM_PI_TOOL_CHANNEL_ENVIRONMENT_BYTES = 262_144
+MAXIMUM_PI_TOOL_CHANNEL_ENVIRONMENT_VALUE_BYTES = 65_536
+MAXIMUM_PI_TOOL_CHANNEL_PASS_FDS = 16
+MAXIMUM_PI_TOOL_CHANNEL_FINALITY_BYTES = 1_048_576
+PI_TOOL_CHANNEL_FINALITY_SCHEMA = "PMW_PI_RPC_TOOL_CHANNEL_FINALITY_1"
 _MAXIMUM_JSON_INTEGER = (1 << 63) - 1
 _EVENT_QUEUE_CAPACITY = 1_024
 
@@ -89,6 +95,12 @@ _MODEL = re.compile(r"^[^\x00\r\n]{1,512}$")
 _TOOL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _REASON = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
 _RESULT_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_TOOL_CHANNEL_ENVIRONMENT_NAME = re.compile(r"^PMW_TOOL_[A-Z0-9_]{1,54}$")
+_TOOL_CHANNEL_SENSITIVE_KEY = re.compile(
+    r"(?:^|[_-])(?:api[_-]?key|auth|client[_-]?secret|credential|password|"
+    r"private[_-]?key|session[_-]?secret|token)(?:$|[_-])",
+    re.IGNORECASE,
+)
 _THINKING_LEVELS = frozenset(
     {"off", "minimal", "low", "medium", "high", "xhigh", "max"}
 )
@@ -143,6 +155,7 @@ _PUBLIC_ENVIRONMENT_NAMES = (
     "XDG_DATA_HOME",
     "XDG_STATE_HOME",
 )
+_CORE_PI_ENVIRONMENT_NAMES = frozenset(_PUBLIC_ENVIRONMENT_NAMES)
 _ACCOUNT_LABEL_DOMAIN = b"PMW_PI_ACCOUNT_LABEL_1\0"
 _TOOL_ALLOWLIST_DOMAIN = b"PMW_PI_TOOL_ALLOWLIST_1\0"
 _INSTALLATION_TREE_PROTOCOL = "PMW_PI_INSTALLATION_TREE_2"
@@ -193,6 +206,174 @@ class PiRpcObserverFinality:
     backend_outcome: BackendOutcome | None = None
     backend_result_file: bytes | None = None
     backend_result_file_error: str | None = None
+    tool_channel_finality: "PiToolChannelFinality | None" = None
+
+
+def _reject_tool_channel_sensitive_keys(value: object) -> None:
+    stack = [value]
+    while stack:
+        selected = stack.pop()
+        if type(selected) is dict:
+            for key, child in selected.items():
+                if type(key) is not str or _TOOL_CHANNEL_SENSITIVE_KEY.search(key):
+                    raise PiBackendError(
+                        "PI_TOOL_CHANNEL_FINALITY_INVALID", "sensitive evidence key"
+                    )
+                stack.append(child)
+        elif type(selected) is list:
+            stack.extend(selected)
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class PiToolChannelLaunch:
+    """Private per-session launch material transferred to the Pi subprocess.
+
+    Environment values and descriptor numbers are intentionally absent from
+    repr, backend identity, prompt evidence, and terminal receipts.  Ownership
+    of every descriptor in ``pass_fds`` transfers to PMW, which closes its
+    parent copy immediately after the one subprocess-spawn attempt.
+    """
+
+    _environment_rows: tuple[tuple[str, str], ...] = field(repr=False)
+    pass_fds: tuple[int, ...] = field(repr=False)
+
+    def __init__(
+        self,
+        *,
+        environment_overlay: Mapping[str, str],
+        pass_fds: tuple[int, ...] = (),
+    ) -> None:
+        if type(environment_overlay) is not dict:
+            raise PiBackendError("PI_TOOL_CHANNEL_LAUNCH_INVALID", "environment")
+        if len(environment_overlay) > MAXIMUM_PI_TOOL_CHANNEL_ENVIRONMENT_KEYS:
+            raise PiBackendError(
+                "PI_TOOL_CHANNEL_LAUNCH_INVALID", "environment count"
+            )
+        rows: list[tuple[str, str]] = []
+        total = 0
+        for key, value in environment_overlay.items():
+            if (
+                type(key) is not str
+                or _TOOL_CHANNEL_ENVIRONMENT_NAME.fullmatch(key) is None
+                or key in _CORE_PI_ENVIRONMENT_NAMES
+                or type(value) is not str
+                or "\x00" in value
+            ):
+                raise PiBackendError(
+                    "PI_TOOL_CHANNEL_LAUNCH_INVALID", "environment"
+                )
+            try:
+                key_bytes = key.encode("utf-8", errors="strict")
+                value_bytes = value.encode("utf-8", errors="strict")
+            except UnicodeError as error:
+                raise PiBackendError(
+                    "PI_TOOL_CHANNEL_LAUNCH_INVALID", "environment"
+                ) from error
+            if len(value_bytes) > MAXIMUM_PI_TOOL_CHANNEL_ENVIRONMENT_VALUE_BYTES:
+                raise PiBackendError(
+                    "PI_TOOL_CHANNEL_LAUNCH_INVALID", "environment value"
+                )
+            total += len(key_bytes) + len(value_bytes) + 2
+            rows.append((key, value))
+        if total > MAXIMUM_PI_TOOL_CHANNEL_ENVIRONMENT_BYTES:
+            raise PiBackendError(
+                "PI_TOOL_CHANNEL_LAUNCH_INVALID", "environment bytes"
+            )
+        rows.sort()
+        if (
+            type(pass_fds) is not tuple
+            or len(pass_fds) > MAXIMUM_PI_TOOL_CHANNEL_PASS_FDS
+            or any(type(item) is not int or item < 3 for item in pass_fds)
+            or pass_fds != tuple(sorted(set(pass_fds)))
+        ):
+            raise PiBackendError("PI_TOOL_CHANNEL_LAUNCH_INVALID", "pass_fds")
+        for descriptor in pass_fds:
+            try:
+                os.fstat(descriptor)
+            except OSError as error:
+                raise PiBackendError(
+                    "PI_TOOL_CHANNEL_LAUNCH_INVALID", "closed pass_fd"
+                ) from error
+        object.__setattr__(self, "_environment_rows", tuple(rows))
+        object.__setattr__(self, "pass_fds", pass_fds)
+
+    @property
+    def environment_overlay(self) -> dict[str, str]:
+        return dict(self._environment_rows)
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class PiToolChannelFinality:
+    """Bounded, secret-key-free channel evidence delivered to an observer.
+
+    PMW persists only the state/failure projection in its ordinary Pi runtime
+    evidence.  The full mapping is an in-process post-stop handoff to the
+    optional observer; the observer must explicitly select any safe subset it
+    wishes to commit in its own declared evidence keys.
+    """
+
+    factory_identity_sha256: str
+    state: str
+    failure_code: str | None
+    _evidence_bytes: bytes = field(repr=False)
+
+    def __init__(
+        self,
+        *,
+        factory_identity_sha256: str,
+        state: str,
+        failure_code: str | None,
+        evidence: Mapping[str, object],
+    ) -> None:
+        if (
+            type(factory_identity_sha256) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", factory_identity_sha256) is None
+            or state not in {"SEALED", "ABORTED", "FAILED"}
+            or (
+                failure_code is not None
+                and (
+                    type(failure_code) is not str
+                    or _REASON.fullmatch(failure_code) is None
+                )
+            )
+            or (state == "SEALED") != (failure_code is None)
+            or not isinstance(evidence, Mapping)
+        ):
+            raise PiBackendError("PI_TOOL_CHANNEL_FINALITY_INVALID")
+        selected = dict(evidence)
+        if state != "SEALED" and selected:
+            raise PiBackendError(
+                "PI_TOOL_CHANNEL_FINALITY_INVALID", "failure evidence"
+            )
+        _reject_tool_channel_sensitive_keys(selected)
+        try:
+            raw = canonical_json(selected)
+        except Exception as error:
+            raise PiBackendError("PI_TOOL_CHANNEL_FINALITY_INVALID") from error
+        if len(raw) > MAXIMUM_PI_TOOL_CHANNEL_FINALITY_BYTES:
+            raise PiBackendError(
+                "PI_TOOL_CHANNEL_FINALITY_INVALID", "evidence too large"
+            )
+        object.__setattr__(self, "factory_identity_sha256", factory_identity_sha256)
+        object.__setattr__(self, "state", state)
+        object.__setattr__(self, "failure_code", failure_code)
+        object.__setattr__(self, "_evidence_bytes", raw)
+
+    @property
+    def evidence(self) -> dict[str, object]:
+        value = json.loads(self._evidence_bytes.decode("utf-8"))
+        if type(value) is not dict:
+            raise AssertionError("tool-channel finality evidence is not an object")
+        return value
+
+    def to_value(self) -> dict[str, object]:
+        return {
+            "schema": PI_TOOL_CHANNEL_FINALITY_SCHEMA,
+            "factory_identity_sha256": self.factory_identity_sha256,
+            "state": self.state,
+            "failure_code": self.failure_code,
+            "evidence": self.evidence,
+        }
 
 
 class PiRpcObserver(Protocol):
@@ -220,6 +401,57 @@ class PiRpcObserverFactory(Protocol):
     def evidence_keys(self) -> tuple[str, ...]: ...
 
     def create(self, request: SessionRequest) -> PiRpcObserver: ...
+
+
+class PiSessionMaterializer(Protocol):
+    """Materialize host-owned, session-local inputs before Pi starts.
+
+    This is a launch input channel, not an observer or a control channel.  Its
+    bounded public identity is fixed into the backend identity before runtime;
+    ``materialize`` runs exactly once after PMW has authenticated the session
+    layout and before the Pi process exists.  The same materializer can
+    therefore be installed in observer-on and observer-off arms without
+    changing the observer treatment.
+    """
+
+    @property
+    def identity(self) -> BackendIdentity: ...
+
+    def verify_runtime(self) -> None: ...
+
+    def materialize(self, request: SessionRequest) -> None: ...
+
+
+class PiToolChannel(Protocol):
+    """One session-local host broker channel with a bounded lifecycle."""
+
+    async def start(self) -> PiToolChannelLaunch: ...
+
+    async def finalize(self, stop_proof: StopProof) -> Mapping[str, object]: ...
+
+    async def abort(self, reason: str) -> None: ...
+
+
+class PiToolChannelFactory(Protocol):
+    """Create identical active-tool channels in observer-on and -off arms.
+
+    PMW owns only launch plumbing and lifecycle.  The implementation behind
+    the channel (for example an owner-only Unix-socket broker) remains supplied
+    by the caller.  No channel property is part of the observer treatment.
+    """
+
+    @property
+    def identity(self) -> BackendIdentity: ...
+
+    @property
+    def environment_names(self) -> tuple[str, ...]: ...
+
+    @property
+    def inherited_fd_count(self) -> int: ...
+
+    def verify_runtime(self) -> None: ...
+
+    def create(self, request: SessionRequest) -> PiToolChannel: ...
 
 
 class PiBackendError(ValueError):
@@ -264,6 +496,94 @@ def _observer_factory_contract(
     ):
         raise PiBackendError("PI_OBSERVER_FACTORY_INVALID", "evidence_keys")
     return identity, evidence_keys
+
+
+def _session_materializer_identity(
+    materializer: PiSessionMaterializer,
+) -> BackendIdentity:
+    try:
+        identity = materializer.identity
+        verify_runtime = materializer.verify_runtime
+        materialize = materializer.materialize
+    except Exception as error:  # noqa: BLE001
+        raise PiBackendError(
+            "PI_SESSION_MATERIALIZER_INVALID", "contract unavailable"
+        ) from error
+    if (
+        not isinstance(identity, BackendIdentity)
+        or not callable(verify_runtime)
+        or not callable(materialize)
+    ):
+        raise PiBackendError("PI_SESSION_MATERIALIZER_INVALID", "contract")
+    return identity
+
+
+def _tool_channel_factory_contract(
+    factory: PiToolChannelFactory,
+) -> tuple[BackendIdentity, tuple[str, ...], int]:
+    try:
+        identity = factory.identity
+        environment_names = factory.environment_names
+        inherited_fd_count = factory.inherited_fd_count
+        verify_runtime = factory.verify_runtime
+        create = factory.create
+    except Exception as error:  # noqa: BLE001
+        raise PiBackendError(
+            "PI_TOOL_CHANNEL_FACTORY_INVALID", "contract unavailable"
+        ) from error
+    if not isinstance(identity, BackendIdentity):
+        raise PiBackendError("PI_TOOL_CHANNEL_FACTORY_INVALID", "identity")
+    if (
+        type(environment_names) is not tuple
+        or len(environment_names) > MAXIMUM_PI_TOOL_CHANNEL_ENVIRONMENT_KEYS
+        or any(
+            type(name) is not str
+            or _TOOL_CHANNEL_ENVIRONMENT_NAME.fullmatch(name) is None
+            or name in _CORE_PI_ENVIRONMENT_NAMES
+            for name in environment_names
+        )
+        or environment_names != tuple(sorted(set(environment_names)))
+    ):
+        raise PiBackendError(
+            "PI_TOOL_CHANNEL_FACTORY_INVALID", "environment_names"
+        )
+    if (
+        type(inherited_fd_count) is not int
+        or not 0 <= inherited_fd_count <= MAXIMUM_PI_TOOL_CHANNEL_PASS_FDS
+        or not callable(verify_runtime)
+        or not callable(create)
+    ):
+        raise PiBackendError("PI_TOOL_CHANNEL_FACTORY_INVALID", "contract")
+    return identity, environment_names, inherited_fd_count
+
+
+def _tool_channel_contract(channel: PiToolChannel) -> None:
+    try:
+        start = channel.start
+        finalize = channel.finalize
+        abort = channel.abort
+    except Exception as error:  # noqa: BLE001
+        raise PiBackendError(
+            "PI_TOOL_CHANNEL_INVALID", "contract unavailable"
+        ) from error
+    if not all(callable(item) for item in (start, finalize, abort)):
+        raise PiBackendError("PI_TOOL_CHANNEL_INVALID", "contract")
+
+
+async def _start_tool_channel_bounded(
+    channel: PiToolChannel, *, timeout_seconds: float
+) -> PiToolChannelLaunch:
+    try:
+        return await asyncio.wait_for(
+            channel.start(), timeout=max(0.05, timeout_seconds)
+        )
+    except asyncio.CancelledError as error:
+        current = asyncio.current_task()
+        if current is not None and current.cancelling():
+            raise
+        raise PiBackendError(
+            "PI_TOOL_CHANNEL_START_FAILED", "CancelledError"
+        ) from error
 
 
 def _fail(code: str, detail: str = "") -> NoReturn:
@@ -1340,6 +1660,9 @@ class _PiRpcTransport:
         environment: Mapping[str, str],
         observer: PiRpcObserver | None = None,
         observer_evidence_keys: tuple[str, ...] = (),
+        tool_channel: PiToolChannel | None = None,
+        tool_channel_factory_identity_sha256: str | None = None,
+        tool_channel_pass_fds: tuple[int, ...] = (),
     ) -> None:
         self.config = config
         self.request = request
@@ -1347,6 +1670,28 @@ class _PiRpcTransport:
         self.environment = dict(environment)
         self.observer = observer
         self.observer_evidence_keys = observer_evidence_keys
+        if (
+            tool_channel is None
+            and (
+                tool_channel_factory_identity_sha256 is not None
+                or tool_channel_pass_fds
+            )
+        ) or (
+            tool_channel is not None
+            and tool_channel_factory_identity_sha256 is None
+        ):
+            raise PiBackendError("PI_TOOL_CHANNEL_LAUNCH_INVALID", "transport")
+        if tool_channel is not None:
+            _tool_channel_contract(tool_channel)
+        self.tool_channel = tool_channel
+        self.tool_channel_factory_identity_sha256 = (
+            tool_channel_factory_identity_sha256
+        )
+        self.tool_channel_pass_fds = tool_channel_pass_fds
+        self.tool_channel_parent_fds_closed = not tool_channel_pass_fds
+        self.tool_channel_finality: PiToolChannelFinality | None = None
+        self.tool_channel_finalize_failure: PiRpcFailure | None = None
+        self.tool_channel_finalized = tool_channel is None
         self.process: asyncio.subprocess.Process | None = None
         self.process_group_id: int | None = None
         self.frames = _BoundedEvidence(
@@ -1404,6 +1749,19 @@ class _PiRpcTransport:
             raise PiBackendError("PI_OBSERVER_FACTORY_FAILED", "late observer")
         self.observer = observer
         self.observer_finalized = False
+
+    def _close_tool_channel_parent_fds(self) -> bool:
+        if not self.tool_channel_pass_fds:
+            return self.tool_channel_parent_fds_closed
+        complete = True
+        for descriptor in self.tool_channel_pass_fds:
+            try:
+                os.close(descriptor)
+            except OSError:
+                complete = False
+        self.tool_channel_pass_fds = ()
+        self.tool_channel_parent_fds_closed = complete
+        return complete
 
     async def _observe_frame(self, direction: str, raw: bytes) -> None:
         if self.observer is None:
@@ -1489,6 +1847,7 @@ class _PiRpcTransport:
             backend_outcome=outcome,
             backend_result_file=backend_result_file,
             backend_result_file_error=backend_result_file_error,
+            tool_channel_finality=self.tool_channel_finality,
         )
         await self._finalize_observer(finality=finality)
 
@@ -1555,12 +1914,18 @@ class _PiRpcTransport:
                 env=self.environment,
                 limit=self.config.maximum_jsonl_line_bytes + 1,
                 start_new_session=True,
+                pass_fds=self.tool_channel_pass_fds,
             )
         except BaseException:
             self.frames.abort()
             self.stderr.abort()
             raise
-        self.process_group_id = self.process.pid
+        finally:
+            close_failure = not self._close_tool_channel_parent_fds()
+        if self.process is not None:
+            self.process_group_id = self.process.pid
+        if close_failure:
+            raise PiRpcFailure("PI_TOOL_CHANNEL_PASS_FD_CLOSE_FAILED")
         self.reader_task = asyncio.create_task(
             self._reader_loop(), name=f"{self.request.spec.session_id}:pi-stdout"
         )
@@ -1735,6 +2100,111 @@ class _PiRpcTransport:
                     task.cancel()
             await asyncio.gather(event_task, failure_task, return_exceptions=True)
 
+    async def _settle_tool_channel(
+        self,
+        *,
+        stop_proof: StopProof,
+        process_created: bool,
+        reason: str,
+    ) -> None:
+        if self.tool_channel_finalized:
+            return
+        channel = self.tool_channel
+        identity_sha256 = self.tool_channel_factory_identity_sha256
+        assert channel is not None and identity_sha256 is not None
+        timeout = max(
+            0.05,
+            min(
+                float(self.request.stop_grace_seconds),
+                float(self.config.response_timeout_seconds),
+            ),
+        )
+        try:
+            if process_created and stop_proof.stopped:
+                try:
+                    returned = await asyncio.wait_for(
+                        channel.finalize(stop_proof), timeout=timeout
+                    )
+                    if not isinstance(returned, Mapping):
+                        raise PiRpcFailure(
+                            "PI_TOOL_CHANNEL_FINALIZE_FAILED",
+                            "evidence must be an object",
+                        )
+                    self.tool_channel_finality = PiToolChannelFinality(
+                        factory_identity_sha256=identity_sha256,
+                        state="SEALED",
+                        failure_code=None,
+                        evidence=dict(returned),
+                    )
+                except asyncio.CancelledError as error:
+                    current = asyncio.current_task()
+                    if current is not None and current.cancelling():
+                        raise
+                    failure = PiRpcFailure(
+                        "PI_TOOL_CHANNEL_FINALIZE_FAILED", "CancelledError"
+                    )
+                    self.tool_channel_finalize_failure = failure
+                    self.tool_channel_finality = PiToolChannelFinality(
+                        factory_identity_sha256=identity_sha256,
+                        state="FAILED",
+                        failure_code=failure.code,
+                        evidence={},
+                    )
+                except Exception as error:  # noqa: BLE001
+                    failure = PiRpcFailure(
+                        "PI_TOOL_CHANNEL_FINALIZE_FAILED",
+                        type(error).__name__,
+                    )
+                    self.tool_channel_finalize_failure = failure
+                    self.tool_channel_finality = PiToolChannelFinality(
+                        factory_identity_sha256=identity_sha256,
+                        state="FAILED",
+                        failure_code=failure.code,
+                        evidence={},
+                    )
+            else:
+                try:
+                    returned = await asyncio.wait_for(
+                        channel.abort(reason), timeout=timeout
+                    )
+                    if returned is not None:
+                        raise PiRpcFailure(
+                            "PI_TOOL_CHANNEL_ABORT_FAILED", "non-null return"
+                        )
+                    self.tool_channel_finality = PiToolChannelFinality(
+                        factory_identity_sha256=identity_sha256,
+                        state="ABORTED",
+                        failure_code="PI_TOOL_CHANNEL_ABORTED",
+                        evidence={},
+                    )
+                except asyncio.CancelledError as error:
+                    current = asyncio.current_task()
+                    if current is not None and current.cancelling():
+                        raise
+                    failure = PiRpcFailure(
+                        "PI_TOOL_CHANNEL_ABORT_FAILED", "CancelledError"
+                    )
+                    self.tool_channel_finalize_failure = failure
+                    self.tool_channel_finality = PiToolChannelFinality(
+                        factory_identity_sha256=identity_sha256,
+                        state="FAILED",
+                        failure_code=failure.code,
+                        evidence={},
+                    )
+                except Exception as error:  # noqa: BLE001
+                    failure = PiRpcFailure(
+                        "PI_TOOL_CHANNEL_ABORT_FAILED", type(error).__name__
+                    )
+                    self.tool_channel_finalize_failure = failure
+                    self.tool_channel_finality = PiToolChannelFinality(
+                        factory_identity_sha256=identity_sha256,
+                        state="FAILED",
+                        failure_code=failure.code,
+                        evidence={},
+                    )
+        finally:
+            self.tool_channel_finalized = True
+
     async def shutdown(
         self,
         *,
@@ -1772,10 +2242,16 @@ class _PiRpcTransport:
         process = self.process
         group = self.process_group_id
         if process is None or group is None:
+            self._close_tool_channel_parent_fds()
             proof = StopProof(
                 stopped=True, reason=reason, detail="no Pi process was created"
             )
             self._close_evidence()
+            await self._settle_tool_channel(
+                stop_proof=proof,
+                process_created=False,
+                reason=reason,
+            )
             self.stop_proof = proof
             return proof
 
@@ -1878,8 +2354,14 @@ class _PiRpcTransport:
             )
         else:
             proof = base_proof
+        await self._settle_tool_channel(
+            stop_proof=proof,
+            process_created=True,
+            reason=reason,
+        )
         # Publish only after the finally block has drained and closed all
-        # transport evidence.  This is the idempotent terminal boundary.
+        # transport evidence and the active tool channel has sealed or failed
+        # closed.  This is the idempotent terminal boundary.
         self.stop_proof = proof
         return proof
 
@@ -1920,6 +2402,23 @@ class _PiRpcTransport:
                     if self.observer_finalize_failure is None
                     else self.observer_finalize_failure.code
                 ),
+            }
+        if self.tool_channel is not None:
+            finality = self.tool_channel_finality
+            value["tool_channel"] = {
+                "schema": PI_TOOL_CHANNEL_FINALITY_SCHEMA,
+                "factory_identity_sha256": (
+                    self.tool_channel_factory_identity_sha256
+                ),
+                "parent_pass_fds_closed": (
+                    self.tool_channel_parent_fds_closed
+                ),
+                "finalized": self.tool_channel_finalized,
+                "state": None if finality is None else finality.state,
+                "failure_code": (
+                    None if finality is None else finality.failure_code
+                ),
+                "observer_treatment": False,
             }
         return value
 
@@ -2477,6 +2976,8 @@ class _RunningPiSession:
                 code = "PROCESS_GROUP_CLEANUP_FAILED"
             elif self.transport.evidence_write_failed:
                 code = "RPC_EVIDENCE_WRITE_FAILED"
+            elif self.transport.tool_channel_finalize_failure is not None:
+                code = self.transport.tool_channel_finalize_failure.code
             outcome = self._failure(
                 code,
                 f"Pi RPC adapter failed: {type(error).__name__}",
@@ -2612,6 +3113,12 @@ class _RunningPiSession:
             return self._failure(
                 "RPC_EVIDENCE_WRITE_FAILED",
                 "Pi transport evidence could not be durably closed",
+                proof,
+            )
+        if self.transport.tool_channel_finalize_failure is not None:
+            return self._failure(
+                self.transport.tool_channel_finalize_failure.code,
+                "Pi tool channel could not be finalized",
                 proof,
             )
         runtime = self._runtime_evidence(proof)
@@ -2812,6 +3319,54 @@ async def _shutdown_despite_cancellation(
             )
 
 
+def _close_unclaimed_tool_channel_fds(
+    launch: PiToolChannelLaunch | None,
+) -> bool:
+    if launch is None:
+        return True
+    complete = True
+    for descriptor in launch.pass_fds:
+        try:
+            os.close(descriptor)
+        except OSError:
+            complete = False
+    return complete
+
+
+async def _abort_tool_channel_despite_cancellation(
+    channel: PiToolChannel,
+    *,
+    launch: PiToolChannelLaunch | None,
+    reason: str,
+    timeout_seconds: float,
+) -> tuple[bool, asyncio.CancelledError | None]:
+    """Close unclaimed FDs and join one bounded pre-transport abort."""
+
+    descriptors_closed = _close_unclaimed_tool_channel_fds(launch)
+
+    async def abort() -> None:
+        returned = await asyncio.wait_for(
+            channel.abort(reason), timeout=max(0.05, timeout_seconds)
+        )
+        if returned is not None:
+            raise PiRpcFailure(
+                "PI_TOOL_CHANNEL_ABORT_FAILED", "non-null return"
+            )
+
+    cleanup = asyncio.create_task(abort(), name="pi-tool-channel-start-abort")
+    observed: asyncio.CancelledError | None = None
+    while True:
+        try:
+            await asyncio.shield(cleanup)
+            return descriptors_closed, observed
+        except asyncio.CancelledError as error:
+            if cleanup.cancelled():
+                return False, observed or error
+            observed = observed or error
+        except BaseException:
+            return False, observed
+
+
 class PiBackend:
     """Run one generic research prompt through Pi's account-OAuth RPC mode."""
 
@@ -2820,14 +3375,53 @@ class PiBackend:
         config: PiBackendConfig,
         *,
         observer_factory: PiRpcObserverFactory | None = None,
+        session_materializer: PiSessionMaterializer | None = None,
+        tool_channel_factory: PiToolChannelFactory | None = None,
     ) -> None:
         if not isinstance(config, PiBackendConfig):
             raise TypeError("config must be PiBackendConfig")
         self._config = config
         self._observer_factory = observer_factory
+        self._session_materializer = session_materializer
+        self._tool_channel_factory = tool_channel_factory
         self._observer_identity: BackendIdentity | None = None
+        self._session_materializer_identity: BackendIdentity | None = None
+        self._tool_channel_identity: BackendIdentity | None = None
+        self._tool_channel_environment_names: tuple[str, ...] = ()
+        self._tool_channel_inherited_fd_count = 0
         self._observer_evidence_keys: tuple[str, ...] = ()
         public_config = config.to_public_value()
+        if session_materializer is not None:
+            materializer_identity = _session_materializer_identity(
+                session_materializer
+            )
+            self._session_materializer_identity = materializer_identity
+            public_config["session_materializer"] = {
+                "identity": materializer_identity.to_value(),
+                "timing": "AFTER_AUTHENTICATED_LAYOUT_BEFORE_PI_PROCESS",
+                "host_to_pi_only": True,
+                "observer_treatment": False,
+            }
+        if tool_channel_factory is not None:
+            (
+                channel_identity,
+                environment_names,
+                inherited_fd_count,
+            ) = _tool_channel_factory_contract(tool_channel_factory)
+            self._tool_channel_identity = channel_identity
+            self._tool_channel_environment_names = environment_names
+            self._tool_channel_inherited_fd_count = inherited_fd_count
+            public_config["tool_channel"] = {
+                "factory_identity": channel_identity.to_value(),
+                "environment_names": list(environment_names),
+                "inherited_fd_count": inherited_fd_count,
+                "lifecycle": (
+                    "START_BEFORE_PI_PROCESS_SEAL_AFTER_PI_PROCESS_STOP"
+                ),
+                "finality_schema": PI_TOOL_CHANNEL_FINALITY_SCHEMA,
+                "private_launch_values": "OMITTED_FROM_PUBLIC_IDENTITY_AND_RECEIPT",
+                "observer_treatment": False,
+            }
         if observer_factory is not None:
             observer_identity, evidence_keys = _observer_factory_contract(
                 observer_factory
@@ -2868,6 +3462,40 @@ class PiBackend:
         """Recheck every pinned runtime input without starting Pi."""
 
         self._config.verify_runtime()
+        if self._session_materializer is not None:
+            identity = _session_materializer_identity(
+                self._session_materializer
+            )
+            if identity != self._session_materializer_identity:
+                _fail("PI_SESSION_MATERIALIZER_DRIFT")
+            try:
+                self._session_materializer.verify_runtime()
+            except PiBackendError:
+                raise
+            except Exception as error:  # noqa: BLE001
+                raise PiBackendError(
+                    "PI_SESSION_MATERIALIZER_DRIFT", type(error).__name__
+                ) from error
+        if self._tool_channel_factory is not None:
+            (
+                identity,
+                environment_names,
+                inherited_fd_count,
+            ) = _tool_channel_factory_contract(self._tool_channel_factory)
+            if (
+                identity != self._tool_channel_identity
+                or environment_names != self._tool_channel_environment_names
+                or inherited_fd_count != self._tool_channel_inherited_fd_count
+            ):
+                _fail("PI_TOOL_CHANNEL_FACTORY_DRIFT")
+            try:
+                self._tool_channel_factory.verify_runtime()
+            except PiBackendError:
+                raise
+            except Exception as error:  # noqa: BLE001
+                raise PiBackendError(
+                    "PI_TOOL_CHANNEL_FACTORY_DRIFT", type(error).__name__
+                ) from error
         if self._observer_factory is not None:
             identity, evidence_keys = _observer_factory_contract(
                 self._observer_factory
@@ -2896,6 +3524,21 @@ class PiBackend:
             raise PiBackendError("PI_OBSERVER_FACTORY_FAILED", "observer")
         return observer
 
+    def _create_tool_channel(
+        self, request: SessionRequest
+    ) -> PiToolChannel | None:
+        factory = self._tool_channel_factory
+        if factory is None:
+            return None
+        try:
+            channel = factory.create(request)
+            _tool_channel_contract(channel)
+        except Exception as error:  # noqa: BLE001
+            raise PiBackendError(
+                "PI_TOOL_CHANNEL_FACTORY_FAILED", type(error).__name__
+            ) from error
+        return channel
+
     def validate_context_window_policy(
         self,
         policy: ContextWindowPolicy,
@@ -2920,6 +3563,9 @@ class PiBackend:
         transport: _PiRpcTransport | None = None
         spawn_task: asyncio.Task[None] | None = None
         verification_task: asyncio.Task[None] | None = None
+        tool_channel: PiToolChannel | None = None
+        tool_channel_launch: PiToolChannelLaunch | None = None
+        tool_channel_start_task: asyncio.Task[PiToolChannelLaunch] | None = None
         handed_off = False
         try:
             if request.context_window_tokens is not None and self._config.extensions:
@@ -2928,6 +3574,15 @@ class PiBackend:
             await asyncio.shield(verification_task)
             verification_task = None
             _require_session_layout(request)
+            if self._session_materializer is not None:
+                try:
+                    await asyncio.to_thread(
+                        self._session_materializer.materialize, request
+                    )
+                except Exception as error:  # noqa: BLE001
+                    raise PiBackendError(
+                        "PI_SESSION_MATERIALIZER_FAILED", type(error).__name__
+                    ) from error
             session_dir = _mkdir_private(request.private_root, "pi-sessions")
             result_path = request.workspace / self._config.result_path
             if result_path.exists() or result_path.is_symlink():
@@ -2939,12 +3594,54 @@ class PiBackend:
                 self._config, request, session_dir=session_dir
             )
             argv = _build_argv(self._config, request, session_dir)
+            tool_channel = self._create_tool_channel(request)
+            if tool_channel is not None:
+                tool_channel_start_task = asyncio.create_task(
+                    _start_tool_channel_bounded(
+                        tool_channel,
+                        timeout_seconds=float(
+                            self._config.response_timeout_seconds
+                        ),
+                    ),
+                    name=f"{request.spec.session_id}:pi-tool-channel-start",
+                )
+                tool_channel_launch = await asyncio.shield(
+                    tool_channel_start_task
+                )
+                tool_channel_start_task = None
+                if not isinstance(tool_channel_launch, PiToolChannelLaunch):
+                    raise PiBackendError(
+                        "PI_TOOL_CHANNEL_START_FAILED", "launch type"
+                    )
+                overlay = tool_channel_launch.environment_overlay
+                if (
+                    tuple(sorted(overlay))
+                    != self._tool_channel_environment_names
+                    or len(tool_channel_launch.pass_fds)
+                    != self._tool_channel_inherited_fd_count
+                    or set(overlay).intersection(environment)
+                ):
+                    raise PiBackendError(
+                        "PI_TOOL_CHANNEL_START_FAILED", "launch contract"
+                    )
+                environment.update(overlay)
             transport = _PiRpcTransport(
                 config=self._config,
                 request=request,
                 argv=argv,
                 environment=environment,
                 observer_evidence_keys=self._observer_evidence_keys,
+                tool_channel=tool_channel,
+                tool_channel_factory_identity_sha256=(
+                    None
+                    if self._tool_channel_identity is None
+                    else self._tool_channel_identity.sha256
+                ),
+                tool_channel_pass_fds=(
+                    ()
+                    if tool_channel_launch is None
+                    else tool_channel_launch.pass_fds
+                ),
             )
             observer = self._create_observer(request)
             if observer is not None:
@@ -2970,6 +3667,18 @@ class PiBackend:
             # post-spawn pin verifier is still running.  Join either task
             # before classifying the start, then prove every created process
             # gone.  No cancellation edge may bypass the handoff boundary.
+            if tool_channel_start_task is not None:
+                await _join_task_despite_cancellation(tool_channel_start_task)
+                if (
+                    tool_channel_start_task.done()
+                    and not tool_channel_start_task.cancelled()
+                ):
+                    try:
+                        selected_launch = tool_channel_start_task.result()
+                    except BaseException:
+                        selected_launch = None
+                    if isinstance(selected_launch, PiToolChannelLaunch):
+                        tool_channel_launch = selected_launch
             for task in (spawn_task, verification_task):
                 if task is not None:
                     await _join_task_despite_cancellation(task)  # type: ignore[arg-type]
@@ -2989,6 +3698,16 @@ class PiBackend:
                         abort_first=False,
                     )
                 else:
+                    if tool_channel is not None:
+                        await _abort_tool_channel_despite_cancellation(
+                            tool_channel,
+                            launch=tool_channel_launch,
+                            reason="START_CANCELLED",
+                            timeout_seconds=min(
+                                float(request.stop_grace_seconds),
+                                float(self._config.response_timeout_seconds),
+                            ),
+                        )
                     proof = StopProof(
                         stopped=True,
                         reason="START_CANCELLED",
@@ -3000,6 +3719,17 @@ class PiBackend:
         except BackendStartError:
             raise
         except Exception as error:
+            if (
+                tool_channel_start_task is not None
+                and tool_channel_start_task.done()
+                and not tool_channel_start_task.cancelled()
+            ):
+                try:
+                    selected_launch = tool_channel_start_task.result()
+                except BaseException:
+                    selected_launch = None
+                if isinstance(selected_launch, PiToolChannelLaunch):
+                    tool_channel_launch = selected_launch
             if transport is not None and transport.process is not None and not handed_off:
                 proof, cleanup_cancel = await _shutdown_despite_cancellation(
                     transport,
@@ -3019,6 +3749,16 @@ class PiBackend:
                         abort_first=False,
                     )
                 else:
+                    if tool_channel is not None:
+                        await _abort_tool_channel_despite_cancellation(
+                            tool_channel,
+                            launch=tool_channel_launch,
+                            reason="START_FAILED",
+                            timeout_seconds=min(
+                                float(request.stop_grace_seconds),
+                                float(self._config.response_timeout_seconds),
+                            ),
+                        )
                     proof = StopProof(
                         stopped=True,
                         reason="START_FAILED",
@@ -3035,12 +3775,16 @@ def load_pi_backend(
     path: Path,
     *,
     observer_factory: PiRpcObserverFactory | None = None,
+    session_materializer: PiSessionMaterializer | None = None,
+    tool_channel_factory: PiToolChannelFactory | None = None,
 ) -> PiBackend:
     """Construct a Pi backend from one strict JSON configuration."""
 
     return PiBackend(
         load_pi_backend_config(path),
         observer_factory=observer_factory,
+        session_materializer=session_materializer,
+        tool_channel_factory=tool_channel_factory,
     )
 
 
@@ -3050,6 +3794,7 @@ __all__ = [
     "PI_PROMPT_PROTOCOL",
     "PI_RPC_DIRECTION_HOST_TO_PI",
     "PI_RPC_DIRECTION_PI_TO_HOST",
+    "PI_TOOL_CHANNEL_FINALITY_SCHEMA",
     "PiBackend",
     "PiBackendConfig",
     "PiBackendError",
@@ -3058,6 +3803,11 @@ __all__ = [
     "PiRpcObserverFinality",
     "PiRpcObserver",
     "PiRpcObserverFactory",
+    "PiSessionMaterializer",
+    "PiToolChannel",
+    "PiToolChannelFactory",
+    "PiToolChannelFinality",
+    "PiToolChannelLaunch",
     "load_pi_backend",
     "load_pi_backend_config",
 ]

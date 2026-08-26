@@ -15,6 +15,7 @@ from pmw_platform.runtime.contracts import (
     BackendIdentity,
     BackendStartError,
     SessionRequest,
+    StopProof,
 )
 from pmw_platform.runtime.pi import (
     PI_BACKEND_CONFIG_SCHEMA,
@@ -23,6 +24,8 @@ from pmw_platform.runtime.pi import (
     PiBackendError,
     PiRpcFrameObservation,
     PiRpcObserverFinality,
+    PiToolChannelFinality,
+    PiToolChannelLaunch,
     load_pi_backend,
     load_pi_backend_config,
 )
@@ -60,6 +63,18 @@ requested_context = (
 reported_context = 1000000 if MODE == "context-mismatch" else requested_context
 command_log = Path.cwd() / "rpc-command-types.jsonl"
 (Path.cwd() / "fake-pi.pid").write_text(str(os.getpid()), encoding="ascii")
+channel_fd = os.environ.get("PMW_TOOL_TEST_TOKEN_FD")
+if channel_fd is not None:
+    descriptor = int(channel_fd)
+    channel_payload = os.read(descriptor, 1024)
+    os.close(descriptor)
+    (Path.cwd() / "tool-channel-child.json").write_text(
+        json.dumps({{
+            "marker": os.environ.get("PMW_TOOL_TEST_MARKER"),
+            "payload": channel_payload.decode("utf-8"),
+        }}, separators=(",", ":"), sort_keys=True),
+        encoding="utf-8",
+    )
 
 def emit(value):
     raw = json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"), sort_keys=True).encode()
@@ -385,6 +400,137 @@ class _RecordingPiObserverFactory:
         )
         self.instances.append(observer)
         return observer
+
+
+class _RecordingSessionMaterializer:
+    def __init__(self, *, fail: bool = False) -> None:
+        self.identity = BackendIdentity(
+            name="test-pi-session-materializer",
+            protocol="TEST_PI_SESSION_MATERIALIZER_1",
+            public_config={"implementation": "zero-provider-test", "revision": 1},
+        )
+        self.fail = fail
+        self.verify_calls = 0
+        self.materialized: list[str] = []
+
+    def verify_runtime(self) -> None:
+        self.verify_calls += 1
+
+    def materialize(self, request: SessionRequest) -> None:
+        if self.fail:
+            raise RuntimeError("injected materializer failure")
+        (request.workspace / "host-materialized.txt").write_text(
+            request.spec.session_id, encoding="utf-8"
+        )
+        self.materialized.append(request.spec.session_id)
+
+
+class _RecordingToolChannel:
+    def __init__(
+        self,
+        request: SessionRequest,
+        *,
+        fail_start: bool = False,
+        block_start: bool = False,
+        fail_finalize: bool = False,
+        block_finalize: bool = False,
+        fail_abort: bool = False,
+        unexpected_environment: bool = False,
+        sensitive_finality: bool = False,
+    ) -> None:
+        self.request = request
+        self.fail_start = fail_start
+        self.block_start = block_start
+        self.fail_finalize = fail_finalize
+        self.block_finalize = block_finalize
+        self.fail_abort = fail_abort
+        self.unexpected_environment = unexpected_environment
+        self.sensitive_finality = sensitive_finality
+        self.start_calls = 0
+        self.finalize_calls = 0
+        self.abort_calls = 0
+        self.finalize_saw_stopped_process = False
+        self.saw_materialized_input = False
+        self.launch: PiToolChannelLaunch | None = None
+
+    async def start(self) -> PiToolChannelLaunch:
+        self.start_calls += 1
+        self.saw_materialized_input = (
+            self.request.workspace / "host-materialized.txt"
+        ).is_file()
+        if self.block_start:
+            await asyncio.Future()
+        if self.fail_start:
+            raise RuntimeError("injected tool-channel start failure")
+        read_descriptor, write_descriptor = os.pipe()
+        try:
+            os.write(write_descriptor, b"private-channel-token")
+        finally:
+            os.close(write_descriptor)
+        environment = {
+            "PMW_TOOL_TEST_MARKER": "private-environment-marker",
+            "PMW_TOOL_TEST_TOKEN_FD": str(read_descriptor),
+        }
+        if self.unexpected_environment:
+            environment["PMW_TOOL_TEST_UNDECLARED"] = "must-fail"
+        self.launch = PiToolChannelLaunch(
+            environment_overlay=environment,
+            pass_fds=(read_descriptor,),
+        )
+        return self.launch
+
+    async def finalize(self, stop_proof: StopProof) -> dict[str, object]:
+        self.finalize_calls += 1
+        assert stop_proof.stopped is True
+        pid = int((self.request.workspace / "fake-pi.pid").read_text())
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            self.finalize_saw_stopped_process = True
+        if self.block_finalize:
+            await asyncio.Future()
+        if self.fail_finalize:
+            raise RuntimeError("injected tool-channel finality failure")
+        if self.sensitive_finality:
+            return {"channel_token": "must-not-cross-finality"}
+        return {
+            "candidate_artifact_sha256": "a" * 64,
+            "submission_count": 1,
+        }
+
+    async def abort(self, reason: str) -> None:
+        assert reason in {"START_CANCELLED", "START_FAILED"}
+        self.abort_calls += 1
+        if self.fail_abort:
+            raise RuntimeError("injected tool-channel abort failure")
+
+
+class _RecordingToolChannelFactory:
+    def __init__(self, **channel_options: object) -> None:
+        self.identity = BackendIdentity(
+            name="test-pi-tool-channel",
+            protocol="TEST_PI_TOOL_CHANNEL_1",
+            public_config={"implementation": "zero-provider-test", "revision": 1},
+        )
+        self.environment_names = (
+            "PMW_TOOL_TEST_MARKER",
+            "PMW_TOOL_TEST_TOKEN_FD",
+        )
+        self.inherited_fd_count = 1
+        self.channel_options = channel_options
+        self.verify_calls = 0
+        self.instances: list[_RecordingToolChannel] = []
+
+    def verify_runtime(self) -> None:
+        self.verify_calls += 1
+
+    def create(self, request: SessionRequest) -> _RecordingToolChannel:
+        channel = _RecordingToolChannel(
+            request,
+            **self.channel_options,  # type: ignore[arg-type]
+        )
+        self.instances.append(channel)
+        return channel
 
 
 def test_config_is_strict_json_and_public_identity_redacts_oauth(tmp_path: Path) -> None:
@@ -1435,6 +1581,374 @@ def test_pi_backend_without_observer_preserves_public_identity(tmp_path: Path) -
 
     assert load_pi_backend(config_path).identity == PiBackend(config).identity
     assert "transport_observer" not in PiBackend(config).identity.public_config
+
+
+def test_session_materializer_is_identity_bound_and_runs_before_pi(
+    tmp_path: Path,
+) -> None:
+    config_path, _agent_dir = _runtime_fixture(tmp_path)
+    materializer = _RecordingSessionMaterializer()
+    backend = load_pi_backend(
+        config_path, session_materializer=materializer
+    )
+    request = _request(tmp_path)
+
+    assert backend.identity.public_config["session_materializer"] == {
+        "identity": materializer.identity.to_value(),
+        "timing": "AFTER_AUTHENTICATED_LAYOUT_BEFORE_PI_PROCESS",
+        "host_to_pi_only": True,
+        "observer_treatment": False,
+    }
+
+    async def run():
+        handle = await backend.start(request)
+        return await handle.wait()
+
+    outcome = asyncio.run(run())
+    assert outcome.success is True
+    assert materializer.materialized == [request.spec.session_id]
+    assert materializer.verify_calls >= 2
+    assert (request.workspace / "host-materialized.txt").read_text() == (
+        request.spec.session_id
+    )
+
+
+def test_session_materializer_failure_prevents_pi_start(tmp_path: Path) -> None:
+    config_path, _agent_dir = _runtime_fixture(tmp_path)
+    backend = PiBackend(
+        load_pi_backend_config(config_path),
+        session_materializer=_RecordingSessionMaterializer(fail=True),
+    )
+    request = _request(tmp_path)
+
+    async def run():
+        with pytest.raises(BackendStartError) as raised:
+            await backend.start(request)
+        return raised.value
+
+    error = asyncio.run(run())
+    assert error.code == "PI_START_FAILED"
+    assert error.stop_proof is not None and error.stop_proof.stopped is True
+    assert not (request.workspace / "fake-pi.pid").exists()
+
+
+def test_session_materializer_identity_drift_is_rejected(tmp_path: Path) -> None:
+    config_path, _agent_dir = _runtime_fixture(tmp_path)
+    materializer = _RecordingSessionMaterializer()
+    backend = PiBackend(
+        load_pi_backend_config(config_path), session_materializer=materializer
+    )
+    materializer.identity = BackendIdentity(
+        name="test-pi-session-materializer",
+        protocol="TEST_PI_SESSION_MATERIALIZER_1",
+        public_config={"implementation": "zero-provider-test", "revision": 2},
+    )
+
+    with pytest.raises(PiBackendError) as raised:
+        backend.verify_runtime()
+    assert raised.value.code == "PI_SESSION_MATERIALIZER_DRIFT"
+
+
+def test_tool_channel_is_identity_bound_private_and_sealed_before_observer(
+    tmp_path: Path,
+) -> None:
+    config_path, _agent_dir = _runtime_fixture(tmp_path)
+    channel_factory = _RecordingToolChannelFactory()
+    materializer = _RecordingSessionMaterializer()
+    observer_factory = _RecordingPiObserverFactory()
+    observer_on = load_pi_backend(
+        config_path,
+        observer_factory=observer_factory,
+        session_materializer=materializer,
+        tool_channel_factory=channel_factory,
+    )
+    observer_off = load_pi_backend(
+        config_path,
+        session_materializer=materializer,
+        tool_channel_factory=channel_factory,
+    )
+    request = _request(tmp_path)
+
+    expected_public = {
+        "factory_identity": channel_factory.identity.to_value(),
+        "environment_names": list(channel_factory.environment_names),
+        "inherited_fd_count": 1,
+        "lifecycle": "START_BEFORE_PI_PROCESS_SEAL_AFTER_PI_PROCESS_STOP",
+        "finality_schema": "PMW_PI_RPC_TOOL_CHANNEL_FINALITY_1",
+        "private_launch_values": "OMITTED_FROM_PUBLIC_IDENTITY_AND_RECEIPT",
+        "observer_treatment": False,
+    }
+    assert observer_on.identity.public_config["tool_channel"] == expected_public
+    assert observer_off.identity.public_config["tool_channel"] == expected_public
+    assert "transport_observer" in observer_on.identity.public_config
+    assert "transport_observer" not in observer_off.identity.public_config
+
+    async def run():
+        handle = await observer_on.start(request)
+        return handle, await handle.wait()
+
+    handle, outcome = asyncio.run(run())
+    channel = channel_factory.instances[0]
+    observer = observer_factory.instances[0]
+    assert outcome.success is True
+    assert channel.start_calls == 1
+    assert channel.saw_materialized_input is True
+    assert channel.finalize_calls == 1
+    assert channel.abort_calls == 0
+    assert channel.finalize_saw_stopped_process is True
+    assert channel_factory.verify_calls >= 2
+    assert observer.finality is not None
+    finality = observer.finality.tool_channel_finality
+    assert isinstance(finality, PiToolChannelFinality)
+    assert finality.state == "SEALED"
+    assert finality.failure_code is None
+    assert finality.evidence == {
+        "candidate_artifact_sha256": "a" * 64,
+        "submission_count": 1,
+    }
+    assert finality.factory_identity_sha256 == channel_factory.identity.sha256
+    assert outcome.evidence["pi_rpc"]["tool_channel"] == {
+        "schema": "PMW_PI_RPC_TOOL_CHANNEL_FINALITY_1",
+        "factory_identity_sha256": channel_factory.identity.sha256,
+        "parent_pass_fds_closed": True,
+        "finalized": True,
+        "state": "SEALED",
+        "failure_code": None,
+        "observer_treatment": False,
+    }
+    child = json.loads(
+        (request.workspace / "tool-channel-child.json").read_text()
+    )
+    assert child == {
+        "marker": "private-environment-marker",
+        "payload": "private-channel-token",
+    }
+    assert channel.launch is not None
+    with pytest.raises(OSError):
+        os.fstat(channel.launch.pass_fds[0])
+    public_and_receipt = (
+        canonical_json(observer_on.identity.to_value())
+        + canonical_json(outcome.to_value())
+    )
+    assert b"private-channel-token" not in public_and_receipt
+    assert b"private-environment-marker" not in public_and_receipt
+    assert handle.transport.tool_channel_finalized is True
+
+
+@pytest.mark.parametrize(
+    "channel_options",
+    (
+        {"fail_finalize": True},
+        {"block_finalize": True},
+        {"sensitive_finality": True},
+    ),
+)
+def test_tool_channel_finality_failure_is_bounded_and_fails_closed(
+    tmp_path: Path,
+    channel_options: dict[str, object],
+) -> None:
+    config_path, _agent_dir = _runtime_fixture(tmp_path)
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["limits"]["response_timeout_seconds"] = 1
+    config_path.write_bytes(canonical_json(config))
+    channel_factory = _RecordingToolChannelFactory(**channel_options)
+    observer_factory = _RecordingPiObserverFactory()
+    backend = load_pi_backend(
+        config_path,
+        observer_factory=observer_factory,
+        tool_channel_factory=channel_factory,
+    )
+    request = _request(tmp_path)
+
+    async def run():
+        started = asyncio.get_running_loop().time()
+        handle = await backend.start(request)
+        outcome = await handle.wait()
+        elapsed = asyncio.get_running_loop().time() - started
+        pending = [
+            task
+            for task in asyncio.all_tasks()
+            if task is not asyncio.current_task()
+            and not task.done()
+            and "tool-channel" in task.get_name()
+        ]
+        return handle, outcome, elapsed, pending
+
+    handle, outcome, elapsed, pending = asyncio.run(run())
+    assert outcome.success is False
+    assert outcome.terminal_reason == "PI_TOOL_CHANNEL_FINALIZE_FAILED"
+    assert elapsed < 3.0
+    assert pending == []
+    channel = channel_factory.instances[0]
+    assert channel.finalize_calls == 1
+    assert channel.finalize_saw_stopped_process is True
+    finality = handle.transport.tool_channel_finality
+    assert isinstance(finality, PiToolChannelFinality)
+    assert finality.state == "FAILED"
+    assert finality.failure_code == "PI_TOOL_CHANNEL_FINALIZE_FAILED"
+    assert finality.evidence == {}
+    observer_finality = observer_factory.instances[0].finality
+    assert observer_finality is not None
+    assert observer_finality.tool_channel_finality == finality
+
+
+@pytest.mark.parametrize(
+    "channel_options",
+    (
+        {"fail_start": True},
+        {"unexpected_environment": True},
+    ),
+)
+def test_tool_channel_start_failure_aborts_before_pi_and_closes_fds(
+    tmp_path: Path,
+    channel_options: dict[str, object],
+) -> None:
+    config_path, _agent_dir = _runtime_fixture(tmp_path)
+    channel_factory = _RecordingToolChannelFactory(**channel_options)
+    backend = load_pi_backend(
+        config_path, tool_channel_factory=channel_factory
+    )
+    request = _request(tmp_path)
+
+    async def run():
+        with pytest.raises(BackendStartError) as raised:
+            await backend.start(request)
+        pending = [
+            task
+            for task in asyncio.all_tasks()
+            if task is not asyncio.current_task()
+            and not task.done()
+            and "tool-channel" in task.get_name()
+        ]
+        return raised.value, pending
+
+    error, pending = asyncio.run(run())
+    assert error.code == "PI_START_FAILED"
+    assert error.stop_proof is not None and error.stop_proof.stopped is True
+    channel = channel_factory.instances[0]
+    assert channel.start_calls == 1
+    assert channel.finalize_calls == 0
+    assert channel.abort_calls == 1
+    assert not (request.workspace / "fake-pi.pid").exists()
+    assert pending == []
+    if channel.launch is not None:
+        with pytest.raises(OSError):
+            os.fstat(channel.launch.pass_fds[0])
+
+
+def test_tool_channel_start_cancellation_is_bounded_and_aborted(
+    tmp_path: Path,
+) -> None:
+    config_path, _agent_dir = _runtime_fixture(tmp_path)
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["limits"]["response_timeout_seconds"] = 1
+    config_path.write_bytes(canonical_json(config))
+    channel_factory = _RecordingToolChannelFactory(block_start=True)
+    backend = load_pi_backend(
+        config_path, tool_channel_factory=channel_factory
+    )
+    request = _request(tmp_path)
+
+    async def run():
+        start = asyncio.create_task(backend.start(request))
+        for _ in range(1_000):
+            if channel_factory.instances:
+                break
+            await asyncio.sleep(0.001)
+        assert channel_factory.instances
+        start.cancel()
+        with pytest.raises(BackendStartError) as raised:
+            await start
+        pending = [
+            task
+            for task in asyncio.all_tasks()
+            if task is not asyncio.current_task()
+            and not task.done()
+            and "tool-channel" in task.get_name()
+        ]
+        return raised.value, pending
+
+    error, pending = asyncio.run(run())
+    assert error.code == "PI_START_CANCELLED"
+    assert error.stop_proof is not None and error.stop_proof.stopped is True
+    channel = channel_factory.instances[0]
+    assert channel.start_calls == 1
+    assert channel.abort_calls == 1
+    assert pending == []
+    assert not (request.workspace / "fake-pi.pid").exists()
+
+
+def test_tool_channel_factory_identity_drift_is_rejected(tmp_path: Path) -> None:
+    config_path, _agent_dir = _runtime_fixture(tmp_path)
+    channel_factory = _RecordingToolChannelFactory()
+    backend = load_pi_backend(
+        config_path, tool_channel_factory=channel_factory
+    )
+    channel_factory.identity = BackendIdentity(
+        name="test-pi-tool-channel",
+        protocol="TEST_PI_TOOL_CHANNEL_1",
+        public_config={"implementation": "zero-provider-test", "revision": 2},
+    )
+
+    with pytest.raises(PiBackendError) as raised:
+        backend.verify_runtime()
+    assert raised.value.code == "PI_TOOL_CHANNEL_FACTORY_DRIFT"
+
+
+def test_tool_channel_factory_rejects_non_pmw_tool_environment(
+    tmp_path: Path,
+) -> None:
+    config_path, _agent_dir = _runtime_fixture(tmp_path)
+    channel_factory = _RecordingToolChannelFactory()
+    channel_factory.environment_names = ("NODE_OPTIONS",)
+
+    with pytest.raises(PiBackendError) as raised:
+        load_pi_backend(config_path, tool_channel_factory=channel_factory)
+    assert raised.value.code == "PI_TOOL_CHANNEL_FACTORY_INVALID"
+
+
+def test_tool_channel_abort_failure_still_fails_start_without_orphaned_task(
+    tmp_path: Path,
+) -> None:
+    config_path, _agent_dir = _runtime_fixture(tmp_path)
+    channel_factory = _RecordingToolChannelFactory(fail_abort=True)
+
+    class FailingObserverFactory(_RecordingPiObserverFactory):
+        def create(self, request: SessionRequest):
+            del request
+            raise RuntimeError("injected observer construction failure")
+
+    backend = load_pi_backend(
+        config_path,
+        observer_factory=FailingObserverFactory(),
+        tool_channel_factory=channel_factory,
+    )
+    request = _request(tmp_path)
+
+    async def run():
+        with pytest.raises(BackendStartError) as raised:
+            await backend.start(request)
+        pending = [
+            task
+            for task in asyncio.all_tasks()
+            if task is not asyncio.current_task()
+            and not task.done()
+            and "tool-channel" in task.get_name()
+        ]
+        return raised.value, pending
+
+    error, pending = asyncio.run(run())
+    assert error.code == "PI_START_FAILED"
+    assert error.stop_proof is not None and error.stop_proof.stopped is True
+    channel = channel_factory.instances[0]
+    assert channel.start_calls == 1
+    assert channel.abort_calls == 1
+    assert channel.finalize_calls == 0
+    assert pending == []
+    assert channel.launch is not None
+    with pytest.raises(OSError):
+        os.fstat(channel.launch.pass_fds[0])
+    assert not (request.workspace / "fake-pi.pid").exists()
 
 
 def test_rpc_observer_factory_identity_drift_is_rejected(tmp_path: Path) -> None:
