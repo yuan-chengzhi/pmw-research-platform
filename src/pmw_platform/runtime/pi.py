@@ -2112,13 +2112,13 @@ class _PiRpcTransport:
         channel = self.tool_channel
         identity_sha256 = self.tool_channel_factory_identity_sha256
         assert channel is not None and identity_sha256 is not None
-        timeout = max(
-            0.05,
-            min(
-                float(self.request.stop_grace_seconds),
-                float(self.config.response_timeout_seconds),
-            ),
-        )
+        # ``stop_grace_seconds`` bounds Pi process-group cleanup.  The tool
+        # channel is settled only after that process-finality boundary, so its
+        # own bounded finalization must use the independently frozen backend
+        # response timeout.  Coupling the two loses already durable channel
+        # evidence whenever post-stop sealing legitimately takes longer than
+        # the (usually much shorter) process grace period.
+        timeout = max(0.05, float(self.config.response_timeout_seconds))
         try:
             if process_created and stop_proof.stopped:
                 try:

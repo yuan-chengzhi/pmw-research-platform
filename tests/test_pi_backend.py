@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import datetime
 import json
 import os
@@ -434,6 +435,7 @@ class _RecordingToolChannel:
         block_start: bool = False,
         fail_finalize: bool = False,
         block_finalize: bool = False,
+        finalize_delay_seconds: float = 0.0,
         fail_abort: bool = False,
         unexpected_environment: bool = False,
         sensitive_finality: bool = False,
@@ -443,6 +445,7 @@ class _RecordingToolChannel:
         self.block_start = block_start
         self.fail_finalize = fail_finalize
         self.block_finalize = block_finalize
+        self.finalize_delay_seconds = finalize_delay_seconds
         self.fail_abort = fail_abort
         self.unexpected_environment = unexpected_environment
         self.sensitive_finality = sensitive_finality
@@ -489,6 +492,8 @@ class _RecordingToolChannel:
             self.finalize_saw_stopped_process = True
         if self.block_finalize:
             await asyncio.Future()
+        if self.finalize_delay_seconds:
+            await asyncio.sleep(self.finalize_delay_seconds)
         if self.fail_finalize:
             raise RuntimeError("injected tool-channel finality failure")
         if self.sensitive_finality:
@@ -1735,11 +1740,52 @@ def test_tool_channel_is_identity_bound_private_and_sealed_before_observer(
     assert handle.transport.tool_channel_finalized is True
 
 
+def test_tool_channel_post_stop_finalize_uses_response_timeout_not_stop_grace(
+    tmp_path: Path,
+) -> None:
+    config_path, _agent_dir = _runtime_fixture(tmp_path)
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["limits"]["response_timeout_seconds"] = 1
+    config_path.write_bytes(canonical_json(config))
+    finalize_delay_seconds = 0.2
+    channel_factory = _RecordingToolChannelFactory(
+        finalize_delay_seconds=finalize_delay_seconds
+    )
+    observer_factory = _RecordingPiObserverFactory()
+    backend = load_pi_backend(
+        config_path,
+        observer_factory=observer_factory,
+        tool_channel_factory=channel_factory,
+    )
+    request = replace(_request(tmp_path), stop_grace_seconds=0.05)
+
+    async def run():
+        handle = await backend.start(request)
+        started = asyncio.get_running_loop().time()
+        outcome = await handle.wait()
+        return handle, outcome, asyncio.get_running_loop().time() - started
+
+    handle, outcome, elapsed = asyncio.run(run())
+    assert elapsed >= finalize_delay_seconds
+    assert outcome.success is True
+    channel = channel_factory.instances[0]
+    assert channel.finalize_calls == 1
+    assert channel.finalize_saw_stopped_process is True
+    finality = handle.transport.tool_channel_finality
+    assert isinstance(finality, PiToolChannelFinality)
+    assert finality.state == "SEALED"
+    assert finality.failure_code is None
+    observer_finality = observer_factory.instances[0].finality
+    assert observer_finality is not None
+    assert observer_finality.tool_channel_finality == finality
+
+
 @pytest.mark.parametrize(
     "channel_options",
     (
         {"fail_finalize": True},
         {"block_finalize": True},
+        {"finalize_delay_seconds": 2.0},
         {"sensitive_finality": True},
     ),
 )
