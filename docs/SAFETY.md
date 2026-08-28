@@ -50,6 +50,14 @@ provider refusal as the actual outcome. For Pi,
 the account's OAuth route near that limit. A malformed PMW proposal is rejected
 as one action.
 
+Every Pi backend config also declares `expected_context_window_tokens` (null or
+a positive exact value) and `disable_auto_compaction` (strict boolean). The
+expected value is an independent pre/post-prompt state lock and must agree with
+any per-launch context selection. With compaction disabled, the first state must
+already report it disabled, the adapter repeats the disable command and confirms
+the state before prompting, and any observed compaction event terminates with
+`PI_COMPACTION_FORBIDDEN`.
+
 Configured Pi context and external extensions are not presently a supported
 combination. Preflight and launch reject that combination with
 `PI_CONTEXT_EXTENSION_COMPATIBILITY_UNPROVEN`; an unset policy continues to use

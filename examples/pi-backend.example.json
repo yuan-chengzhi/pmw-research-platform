@@ -1,5 +1,5 @@
 {
-  "schema": "PMW_PI_RPC_BACKEND_CONFIG_1",
+  "schema": "PMW_PI_RPC_BACKEND_CONFIG_2",
   "name": "pinned-local-pi",
   "node_path": "/absolute/path/to/reviewed/node",
   "pi_entrypoint": "/absolute/path/to/pi-coding-agent/dist/cli.js",
@@ -9,6 +9,8 @@
   "thinking": "max",
   "auth_kind": "oauth",
   "account_label": "replace-with-stable-local-account-label",
+  "expected_context_window_tokens": null,
+  "disable_auto_compaction": false,
   "tools": [],
   "extensions": [],
   "result_path": "pi-result.json",

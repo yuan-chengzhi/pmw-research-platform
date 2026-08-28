@@ -107,7 +107,10 @@ Pi RPC 或其他 backend 不会改变数学记录的身份边界。
 - **Pi RPC backend** 向内容固定的 Pi 安装发送一次通用 research prompt，等待
   `agent_settled`，只启用配置中精确列出的内置工具和显式 pin 的 extension 入口。
   示例配置默认是 `tools: []` 与 `extensions: []`；工具必须由操作者显式开启。host
-  不替 Pi 做 retry、模型降档或隐式 context downcap。adapter 不把 OAuth
+  不替 Pi 做 retry、模型降档或隐式 context downcap。严格 backend config 另有
+  `expected_context_window_tokens` 与 `disable_auto_compaction`：前者非 null 时在
+  prompt 前后精确核对 Pi state，后者为 true 时在 prompt 前重复确认关闭状态并把
+  运行中的任何 compaction event 作为 apparatus failure。adapter 不把 OAuth
   credential 值或路径主动序列化进公开 identity；但 Pi 子进程的有界 raw
   frame/stderr evidence 仍是 trusted/redaction boundary，不能假定第三方错误消息
   永远不会回显敏感内容。
@@ -123,6 +126,11 @@ backend config 可以使用普通缩进 JSON；loader 会拒绝重复 key、非�
 [`examples/command-backend.json`](examples/command-backend.json) 与
 [`examples/pi-backend.example.json`](examples/pi-backend.example.json)；其中绝对路径
 必须替换为操作者已经审查并信任的本地文件。
+
+Pi config 的 `expected_context_window_tokens`（正整数或 null）和
+`disable_auto_compaction`（严格 boolean）都是必填 identity 字段。null/false 保留
+通用 Pi 行为；长期运行若要求固定 1M 且禁止 compaction，应明确配置
+`1000000/true`，而不是依赖 prompt 或 agent directory 中未认证的设置。
 
 command backend 的边界是“受管但协作式的进程组”，不是 OS sandbox。它不继承
 宿主环境中的 token/API key，但同一账户下的恶意程序仍可能主动探测宿主可读路径；
@@ -150,6 +158,12 @@ compaction 与 overflow 判断，但不是累计 token 配额，也不是声称 
 近上限 canary 的严格 pre-HTTP input gate。provider 拒绝仍应如实失败，不会自动
 重试或静默降档。command backend 没有模型 context 概念，因此配置 context 会在
 创建 runtime 前被拒绝。
+
+Launch 的 per-session context selection 与 backend 的
+`expected_context_window_tokens` 是两个同时生效的锁；若二者均非 null，Pi 报告值
+必须同时精确等于二者。`disable_auto_compaction: true` 还要求首个 state 已报告
+`autoCompactionEnabled: false`，随后 host 显式发送 `set_auto_compaction(false)` 并
+再次回读确认；任何 `compaction_start`/`compaction_end` 都立即失败。
 
 当 Pi launch 显式设置 context window 时，当前实现还要求 `extensions: []`；任何
 外部 Pi extension 与这个 context mutation 的组合都会在启动前以

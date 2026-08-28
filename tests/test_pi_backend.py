@@ -62,6 +62,8 @@ requested_context = (
     else 1000000
 )
 reported_context = 1000000 if MODE == "context-mismatch" else requested_context
+get_state_count = 0
+auto_compaction_enabled = MODE == "auto-compaction-initially-enabled"
 command_log = Path.cwd() / "rpc-command-types.jsonl"
 (Path.cwd() / "fake-pi.pid").write_text(str(os.getpid()), encoding="ascii")
 channel_fd = os.environ.get("PMW_TOOL_TEST_TOKEN_FD")
@@ -94,21 +96,39 @@ def response(command, request_id, data=None, success=True):
 for raw in sys.stdin.buffer:
     request = json.loads(raw)
     with command_log.open("a", encoding="utf-8") as stream:
-        stream.write(json.dumps({{"type": request["type"]}}, separators=(",", ":")) + "\\n")
+        command_record = {{"type": request["type"]}}
+        if request["type"] == "set_auto_compaction":
+            command_record["enabled"] = request.get("enabled")
+        stream.write(json.dumps(command_record, separators=(",", ":")) + "\\n")
     kind = request["type"]
     request_id = request["id"]
     if kind == "get_state":
+        get_state_count += 1
+        current_context = (
+            900000
+            if MODE == "context-post-mismatch" and get_state_count >= 2
+            else reported_context
+        )
         response(kind, request_id, {{
             "model": {{
                 "provider": provider,
                 "id": model,
-                "contextWindow": reported_context,
+                "contextWindow": current_context,
             }},
             "thinkingLevel": thinking,
             "isStreaming": False,
             "isCompacting": False,
+            "autoCompactionEnabled": auto_compaction_enabled,
             "sessionId": "fake-pi-session",
         }})
+    elif kind == "set_auto_compaction":
+        if MODE == "auto-compaction-command-rejected":
+            response(kind, request_id, success=False)
+        else:
+            auto_compaction_enabled = False
+            if MODE == "auto-compaction-confirmation-enabled":
+                auto_compaction_enabled = True
+            response(kind, request_id)
     elif kind == "prompt":
         response(kind, request_id)
         if MODE == "partial-result-hang":
@@ -133,6 +153,9 @@ for raw in sys.stdin.buffer:
                         "delta": str(index % 10),
                     }},
                 }})
+            continue
+        if MODE == "compaction-event":
+            emit({{"type": "compaction_start", "reason": "threshold"}})
             continue
         if MODE != "hang":
             outcome = {{
@@ -221,6 +244,8 @@ def _runtime_fixture(tmp_path: Path, *, mode: str = "success") -> tuple[Path, Pa
         "thinking": "max",
         "auth_kind": "oauth",
         "account_label": "private-account-label",
+        "expected_context_window_tokens": None,
+        "disable_auto_compaction": False,
         "tools": [],
         "extensions": [],
         "result_path": "pi-result.json",
@@ -285,6 +310,18 @@ def _request(
         stop_grace_seconds=1.0,
         context_window_tokens=context_window_tokens,
     )
+
+
+def _configure_runtime_contract(
+    config_path: Path,
+    *,
+    expected_context_window_tokens: int | None = None,
+    disable_auto_compaction: bool = False,
+) -> None:
+    value = json.loads(config_path.read_text(encoding="utf-8"))
+    value["expected_context_window_tokens"] = expected_context_window_tokens
+    value["disable_auto_compaction"] = disable_auto_compaction
+    config_path.write_bytes(canonical_json(value))
 
 
 def _command_types(request: SessionRequest) -> list[str]:
@@ -546,6 +583,15 @@ def test_config_is_strict_json_and_public_identity_redacts_oauth(tmp_path: Path)
 
     assert backend.identity.public_config["auth_kind"] == "oauth"
     assert backend.identity.public_config["provider"] == "fake-provider"
+    assert backend.identity.protocol == "PMW_PI_RPC_2"
+    assert backend.identity.public_config["schema"] == (
+        "PMW_PI_RPC_BACKEND_CONFIG_2"
+    )
+    assert backend.identity.public_config["expected_context_window_tokens"] is None
+    assert backend.identity.public_config["disable_auto_compaction"] is False
+    assert backend.identity.public_config["prompt_protocol"] == (
+        "PMW_PI_RESEARCH_PROMPT_2"
+    )
     assert len(backend.identity.public_config["account_label_sha256"]) == 64
     assert str(agent_dir) not in public
     assert "private-account-label" not in public
@@ -582,6 +628,33 @@ def test_config_is_strict_json_and_public_identity_redacts_oauth(tmp_path: Path)
     assert reparsed.to_public_value() == config.to_public_value()
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("expected_context_window_tokens", True),
+        ("expected_context_window_tokens", 0),
+        ("expected_context_window_tokens", 2_147_483_648),
+        ("disable_auto_compaction", None),
+        ("disable_auto_compaction", 0),
+    ],
+)
+def test_runtime_profile_config_fields_are_strict(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    config_path, _agent_dir = _runtime_fixture(tmp_path)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw[field] = value
+    config_path.write_bytes(canonical_json(raw))
+
+    with pytest.raises(PiBackendError) as raised:
+        load_pi_backend_config(config_path)
+
+    assert raised.value.code == "MALFORMED_PI_CONFIG"
+    assert raised.value.detail == field
+
+
 def test_context_extension_preserves_model_routing_headers() -> None:
     extension = (
         Path(pi_runtime.__file__).resolve().with_name("pi-context-window.mjs")
@@ -609,10 +682,14 @@ def test_prompt_defers_role_and_mathematical_objective_to_briefing(
         request.workspace / "pi-result.json",
     )
 
-    assert (
-        "Follow the role, mathematical objective, and research instructions in the "
-        "host-authenticated briefing below."
-    ) in prompt
+    assert "temporary private context" in prompt
+    assert "persistent mathematical world" in prompt
+    assert "The mathematical world remains after this process ends." in prompt
+    assert "authenticated Orientation mechanism" in prompt
+    assert "Your identity, role, mathematical objective" in prompt
+    header = prompt.split("BEGIN_HOST_AUTHENTICATED_BRIEFING_JSON", 1)[0].casefold()
+    for forbidden in ("research session", "campaign", "phase", "evaluation"):
+        assert forbidden not in header
     assert "Read the full current mathematical state" not in prompt
     assert "choose a valuable route" not in prompt
     assert "leave a concise, checkable contribution" not in prompt
@@ -935,6 +1012,180 @@ def test_context_override_mismatch_fails_before_prompt(
     assert outcome.terminal_reason == "RUNTIME_PROFILE_MISMATCH"
     assert _command_types(request)[0] == "get_state"
     assert "prompt" not in _command_types(request)
+
+
+def test_backend_expected_context_is_exact_before_and_after_prompt(
+    tmp_path: Path,
+) -> None:
+    config_path, _agent_dir = _runtime_fixture(tmp_path)
+    _configure_runtime_contract(
+        config_path,
+        expected_context_window_tokens=1_000_000,
+    )
+    backend = PiBackend(load_pi_backend_config(config_path))
+    request = _request(tmp_path)
+
+    async def run():
+        handle = await backend.start(request)
+        return await handle.wait()
+
+    outcome = asyncio.run(run())
+
+    assert outcome.success is True
+    runtime = outcome.evidence["pi_rpc"]
+    assert runtime["backend_expected_context_window_tokens"] == 1_000_000
+    assert runtime["pi_reported_context_window"] == 1_000_000
+    assert _command_types(request) == [
+        "get_state",
+        "prompt",
+        "get_state",
+        "get_session_stats",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected", "prompt_was_sent"),
+    [
+        ("success", 400_000, False),
+        ("context-post-mismatch", 1_000_000, True),
+    ],
+)
+def test_backend_expected_context_mismatch_fails_closed_on_both_gates(
+    tmp_path: Path,
+    mode: str,
+    expected: int,
+    prompt_was_sent: bool,
+) -> None:
+    config_path, _agent_dir = _runtime_fixture(tmp_path, mode=mode)
+    _configure_runtime_contract(
+        config_path,
+        expected_context_window_tokens=expected,
+    )
+    backend = PiBackend(load_pi_backend_config(config_path))
+    request = _request(tmp_path)
+
+    async def run():
+        handle = await backend.start(request)
+        return await handle.wait()
+
+    outcome = asyncio.run(run())
+
+    assert outcome.success is False
+    assert outcome.terminal_reason == "RUNTIME_PROFILE_MISMATCH"
+    assert ("prompt" in _command_types(request)) is prompt_was_sent
+
+
+def test_disable_auto_compaction_is_confirmed_before_prompt(
+    tmp_path: Path,
+) -> None:
+    config_path, _agent_dir = _runtime_fixture(tmp_path)
+    _configure_runtime_contract(
+        config_path,
+        expected_context_window_tokens=1_000_000,
+        disable_auto_compaction=True,
+    )
+    backend = PiBackend(load_pi_backend_config(config_path))
+    request = _request(tmp_path)
+
+    async def run():
+        handle = await backend.start(request)
+        return await handle.wait()
+
+    outcome = asyncio.run(run())
+
+    assert outcome.success is True
+    runtime = outcome.evidence["pi_rpc"]
+    assert runtime["disable_auto_compaction"] is True
+    assert runtime["auto_compaction_disable_confirmed"] is True
+    assert runtime["observed_pi_compaction_events"] == 0
+    assert runtime["pi_retry_compaction_policy"] == (
+        "AUTO_COMPACTION_DISABLED_AND_EVENTS_FORBIDDEN"
+    )
+    rpc_commands = [
+        json.loads(line)
+        for line in (
+            request.workspace / "rpc-command-types.jsonl"
+        ).read_text().splitlines()
+    ]
+    assert any(
+        command.get("type") == "set_auto_compaction"
+        and command.get("enabled") is False
+        for command in rpc_commands
+    )
+    assert _command_types(request) == [
+        "get_state",
+        "set_auto_compaction",
+        "get_state",
+        "prompt",
+        "get_state",
+        "get_session_stats",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("mode", "reason", "commands"),
+    [
+        (
+            "auto-compaction-initially-enabled",
+            "RUNTIME_PROFILE_MISMATCH",
+            ["get_state"],
+        ),
+        (
+            "auto-compaction-command-rejected",
+            "PI_AUTO_COMPACTION_CONTROL_REJECTED",
+            ["get_state", "set_auto_compaction"],
+        ),
+        (
+            "auto-compaction-confirmation-enabled",
+            "RUNTIME_PROFILE_MISMATCH",
+            ["get_state", "set_auto_compaction", "get_state"],
+        ),
+    ],
+)
+def test_disable_auto_compaction_pre_prompt_gate_fails_closed(
+    tmp_path: Path,
+    mode: str,
+    reason: str,
+    commands: list[str],
+) -> None:
+    config_path, _agent_dir = _runtime_fixture(tmp_path, mode=mode)
+    _configure_runtime_contract(config_path, disable_auto_compaction=True)
+    backend = PiBackend(load_pi_backend_config(config_path))
+    request = _request(tmp_path)
+
+    async def run():
+        handle = await backend.start(request)
+        return await handle.wait()
+
+    outcome = asyncio.run(run())
+
+    assert outcome.success is False
+    assert outcome.terminal_reason == reason
+    observed_commands = _command_types(request)
+    assert observed_commands[:-1] == commands
+    assert observed_commands[-1] == "abort"
+    assert "prompt" not in observed_commands
+
+
+def test_compaction_event_is_immediately_forbidden_when_disabled(
+    tmp_path: Path,
+) -> None:
+    config_path, _agent_dir = _runtime_fixture(tmp_path, mode="compaction-event")
+    _configure_runtime_contract(config_path, disable_auto_compaction=True)
+    backend = PiBackend(load_pi_backend_config(config_path))
+    request = _request(tmp_path)
+
+    async def run():
+        handle = await backend.start(request)
+        return await handle.wait()
+
+    outcome = asyncio.run(run())
+
+    assert outcome.success is False
+    assert outcome.terminal_reason == "PI_COMPACTION_FORBIDDEN"
+    assert "prompt" in _command_types(request)
+    frames = (request.evidence / "pi.frames.jsonl").read_bytes()
+    assert b'"type":"compaction_start"' in frames
 
 
 def test_extension_error_is_terminal_apparatus_failure(tmp_path: Path) -> None:

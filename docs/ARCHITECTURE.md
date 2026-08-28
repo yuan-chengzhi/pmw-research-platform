@@ -172,6 +172,13 @@ installation tree, settings and explicit extension entry files. A sorted
 allowlist may enable Pi's built-in workspace tools; custom tools still require
 explicit pinned extensions. It sends one generic research prompt and observes
 Pi-native events without host retry, implicit context downcap or model fallback.
+Two required backend-identity fields make stronger runs explicit:
+`expected_context_window_tokens` is either null or an exact positive state
+assertion checked before and after the prompt, while `disable_auto_compaction`
+is a strict boolean. When enabled, the adapter requires the first state to
+already report `autoCompactionEnabled: false`, sends and checks an explicit
+`set_auto_compaction(false)`, confirms a second state before prompting, and
+fails immediately on any `compaction_start` or `compaction_end` frame.
 The shipped example starts from `tools: []` and `extensions: []`; no workspace
 tool is implicitly enabled. When a configured context window is selected,
 external extensions are currently rejected as described above. The adapter
@@ -272,7 +279,9 @@ schema migration.
 ## Deliberate non-goals for v0.1
 
 - no claim that process-group control equals OS containment;
-- no automatic model/OAuth canary, retry, compaction or context ceiling;
+- no automatic model/OAuth canary, retry, host-triggered compaction or hidden
+  context ceiling; config may explicitly require an exact reported window and
+  forbid Pi auto-compaction;
 - no authoritative agent-facing verifier and no PMW coordination tool plane;
   the in-session kit is advisory and its invocation ledger is observed, not
   proven;

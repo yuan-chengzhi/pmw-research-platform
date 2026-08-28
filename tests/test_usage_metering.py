@@ -218,8 +218,11 @@ for raw in sys.stdin.buffer:
             "thinkingLevel": thinking,
             "isStreaming": False,
             "isCompacting": False,
+            "autoCompactionEnabled": False,
             "sessionId": "fake-pi-session",
         }})
+    elif kind == "set_auto_compaction":
+        response(kind, request_id)
     elif kind == "prompt":
         response(kind, request_id)
         for turn in TURNS:
@@ -284,6 +287,8 @@ def _pi_backend(tmp_path: Path, *, reports_usage: bool) -> PiBackend:
         "thinking": "max",
         "auth_kind": "oauth",
         "account_label": "private-account-label",
+        "expected_context_window_tokens": None,
+        "disable_auto_compaction": False,
         "tools": [],
         "extensions": [],
         "result_path": "pi-result.json",
