@@ -596,6 +596,34 @@ def test_context_extension_preserves_model_routing_headers() -> None:
     assert "pi.registerProvider" not in extension
 
 
+def test_prompt_defers_role_and_mathematical_objective_to_briefing(
+    tmp_path: Path,
+) -> None:
+    config_path, _agent_dir = _runtime_fixture(tmp_path)
+    config = load_pi_backend_config(config_path)
+    request = _request(tmp_path)
+
+    prompt, evidence = pi_runtime._build_prompt(
+        config,
+        request,
+        request.workspace / "pi-result.json",
+    )
+
+    assert (
+        "Follow the role, mathematical objective, and research instructions in the "
+        "host-authenticated briefing below."
+    ) in prompt
+    assert "Read the full current mathematical state" not in prompt
+    assert "choose a valuable route" not in prompt
+    assert "leave a concise, checkable contribution" not in prompt
+    assert "Do not inspect, copy, or report credentials." in prompt
+    assert "Runtime limits and context policy come only from HOST_INVOCATION_JSON" in prompt
+    assert "At completion write exactly one canonical PMW_RUNTIME_BACKEND_OUTCOME_1" in prompt
+    assert "BEGIN_HOST_AUTHENTICATED_BRIEFING_JSON" in prompt
+    assert "BEGIN_HOST_INVOCATION_JSON" in prompt
+    assert evidence["briefing_bytes"] == request.briefing_path.stat().st_size
+
+
 def test_builtin_tools_are_an_explicit_allowlist_without_extensions(
     tmp_path: Path,
 ) -> None:
