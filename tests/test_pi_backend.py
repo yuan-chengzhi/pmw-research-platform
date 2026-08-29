@@ -679,7 +679,6 @@ def test_prompt_defers_role_and_mathematical_objective_to_briefing(
     prompt, evidence = pi_runtime._build_prompt(
         config,
         request,
-        request.workspace / "pi-result.json",
     )
 
     assert "temporary private context" in prompt
@@ -715,9 +714,14 @@ def test_prompt_defers_role_and_mathematical_objective_to_briefing(
     assert "`durable_refs`" in prompt
     assert "publication receipts" in prompt
     assert "world snapshot refs" in prompt
+    assert "workspace-relative path `pi-result.json`" in prompt
+    assert "Do not prefix it with a Host filesystem path." in prompt
+    assert str(request.workspace) not in prompt
     assert "BEGIN_HOST_AUTHENTICATED_BRIEFING_JSON" in prompt
     assert "BEGIN_HOST_INVOCATION_JSON" in prompt
     assert evidence["briefing_bytes"] == request.briefing_path.stat().st_size
+    assert evidence["result_path"] == "pi-result.json"
+    assert evidence["result_path_scope"] == "PI_WORKSPACE_RELATIVE"
 
 
 def test_builtin_tools_are_an_explicit_allowlist_without_extensions(

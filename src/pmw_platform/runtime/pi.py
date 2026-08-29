@@ -170,7 +170,8 @@ _PROMPT_PROTOCOL_BYTES = (
     b"PMW_PI_RESEARCH_PROMPT_2\0persistent-world-temporary-process-context\0"
     b"authenticated-briefing-orientation-identity\0briefing-json\0"
     b"invocation-json\0identity-free-backend-outcome\0"
-    b"exact-seven-field-backend-outcome\0file-or-final-envelope"
+    b"exact-seven-field-backend-outcome\0workspace-relative-result-path\0"
+    b"file-or-final-envelope"
 )
 _CONTEXT_WINDOW_EXTENSION_NAME = "pi-context-window.mjs"
 _CONTEXT_WINDOW_FLAG = "pmw-context-window-tokens"
@@ -1525,7 +1526,6 @@ def _empty_completion_outcome_json() -> str:
 def _build_prompt(
     config: PiBackendConfig,
     request: SessionRequest,
-    result_path: Path,
 ) -> tuple[str, dict[str, object]]:
     briefing = _read_prompt_input(
         request.briefing_path,
@@ -1566,9 +1566,10 @@ def _build_prompt(
         "them there; normally use an empty list. `usage` and `evidence` may be empty "
         "objects. Do not replace these fields with `status`, singular `contribution`, "
         "`durable_refs`, publication receipts, or world snapshot refs. "
-        f"Write the object with no trailing newline to {result_path}. If the "
-        "available tools cannot write that file, place the same canonical JSON in "
-        f"your final assistant message between `{_ENVELOPE_BEGIN.strip()}` and "
+        "Write the object with no trailing newline to the workspace-relative path "
+        f"`{config.result_path}`. Do not prefix it with a Host filesystem path. If "
+        "the available tools cannot write that file, place the same canonical JSON "
+        f"in your final assistant message between `{_ENVELOPE_BEGIN.strip()}` and "
         f"`{_ENVELOPE_END.strip()}` on their own lines. Do not invent durable refs.\n\n"
         "BEGIN_HOST_AUTHENTICATED_BRIEFING_JSON\n"
     ).encode("utf-8")
@@ -1589,6 +1590,8 @@ def _build_prompt(
         "briefing_sha256": hashlib.sha256(briefing).hexdigest(),
         "invocation_bytes": len(invocation),
         "invocation_sha256": hashlib.sha256(invocation).hexdigest(),
+        "result_path": config.result_path,
+        "result_path_scope": "PI_WORKSPACE_RELATIVE",
     }
 
 
@@ -3690,9 +3693,7 @@ class PiBackend:
             result_path = request.workspace / self._config.result_path
             if result_path.exists() or result_path.is_symlink():
                 _fail("PI_RESULT_INVALID", "result path already exists")
-            prompt, prompt_evidence = _build_prompt(
-                self._config, request, result_path
-            )
+            prompt, prompt_evidence = _build_prompt(self._config, request)
             environment = _session_environment(
                 self._config, request, session_dir=session_dir
             )
