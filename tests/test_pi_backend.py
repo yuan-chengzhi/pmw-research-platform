@@ -655,6 +655,46 @@ def test_runtime_profile_config_fields_are_strict(
     assert raised.value.detail == field
 
 
+@pytest.mark.parametrize(
+    "result_path",
+    ("", ".", "..", "../result.json", "nested/result.json", "/tmp/result.json", "a\\b"),
+)
+def test_result_path_is_one_safe_workspace_relative_filename(
+    tmp_path: Path,
+    result_path: str,
+) -> None:
+    config_path, _agent_dir = _runtime_fixture(tmp_path)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["result_path"] = result_path
+    config_path.write_bytes(canonical_json(raw))
+
+    with pytest.raises(PiBackendError) as raised:
+        load_pi_backend_config(config_path)
+
+    assert raised.value.code == "MALFORMED_PI_CONFIG"
+    assert raised.value.detail == "result_path"
+
+
+def test_preexisting_result_symlink_is_rejected_before_pi_start(
+    tmp_path: Path,
+) -> None:
+    config_path, _agent_dir = _runtime_fixture(tmp_path)
+    backend = load_pi_backend(config_path)
+    request = _request(tmp_path)
+    request.workspace.mkdir(parents=True, exist_ok=True)
+    target = request.workspace / "outside-result.json"
+    target.write_text("not a backend outcome", encoding="utf-8")
+    (request.workspace / "pi-result.json").symlink_to(target)
+
+    with pytest.raises(BackendStartError) as raised:
+        asyncio.run(backend.start(request))
+
+    assert raised.value.code == "PI_START_FAILED"
+    assert isinstance(raised.value.__cause__, PiBackendError)
+    assert raised.value.__cause__.code == "PI_RESULT_INVALID"
+    assert raised.value.stop_proof.stopped is True
+
+
 def test_context_extension_preserves_model_routing_headers() -> None:
     extension = (
         Path(pi_runtime.__file__).resolve().with_name("pi-context-window.mjs")
