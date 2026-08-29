@@ -169,7 +169,8 @@ _INSTALLATION_TREE_DOMAIN = b"PMW_PI_INSTALLATION_TREE_2\0"
 _PROMPT_PROTOCOL_BYTES = (
     b"PMW_PI_RESEARCH_PROMPT_2\0persistent-world-temporary-process-context\0"
     b"authenticated-briefing-orientation-identity\0briefing-json\0"
-    b"invocation-json\0identity-free-backend-outcome\0file-or-final-envelope"
+    b"invocation-json\0identity-free-backend-outcome\0"
+    b"exact-seven-field-backend-outcome\0file-or-final-envelope"
 )
 _CONTEXT_WINDOW_EXTENSION_NAME = "pi-context-window.mjs"
 _CONTEXT_WINDOW_FLAG = "pmw-context-window-tokens"
@@ -1504,6 +1505,23 @@ def _read_prompt_input(path: Path, *, maximum_bytes: int, label: str) -> bytes:
     return raw
 
 
+def _empty_completion_outcome_json() -> str:
+    """Return the exact minimal result shape shown to a Pi session.
+
+    Keep the example generated from the runtime contract rather than spelling a
+    second, prompt-only schema.  A session which already published its durable
+    work through authenticated tools normally needs no backend contribution.
+    """
+
+    return canonical_json(
+        BackendOutcome(
+            success=True,
+            terminal_reason="RESEARCH_COMPLETED",
+            summary="Research process completed.",
+        ).to_value()
+    ).decode("utf-8")
+
+
 def _build_prompt(
     config: PiBackendConfig,
     request: SessionRequest,
@@ -1541,9 +1559,16 @@ def _build_prompt(
         "Any proposed contribution must therefore use the identity-free "
         "PMW_RESEARCH_CONTRIBUTION_1 schema.\n\n"
         "At completion write exactly one canonical PMW_RUNTIME_BACKEND_OUTCOME_1 "
-        f"JSON object (no trailing newline) to {result_path}. If the available tools "
-        "cannot write that file, place the same canonical JSON in your final assistant "
-        f"message between `{_ENVELOPE_BEGIN.strip()}` and "
+        "JSON object with exactly the seven fields shown in this minimal valid "
+        f"example: `{_empty_completion_outcome_json()}`. `contributions` is always "
+        "a JSON list of still-unpublished identity-free contributions. If durable "
+        "records were already published through authenticated tools, do not repeat "
+        "them there; normally use an empty list. `usage` and `evidence` may be empty "
+        "objects. Do not replace these fields with `status`, singular `contribution`, "
+        "`durable_refs`, publication receipts, or world snapshot refs. "
+        f"Write the object with no trailing newline to {result_path}. If the "
+        "available tools cannot write that file, place the same canonical JSON in "
+        f"your final assistant message between `{_ENVELOPE_BEGIN.strip()}` and "
         f"`{_ENVELOPE_END.strip()}` on their own lines. Do not invent durable refs.\n\n"
         "BEGIN_HOST_AUTHENTICATED_BRIEFING_JSON\n"
     ).encode("utf-8")

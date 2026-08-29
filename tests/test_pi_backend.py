@@ -696,6 +696,25 @@ def test_prompt_defers_role_and_mathematical_objective_to_briefing(
     assert "Do not inspect, copy, or report credentials." in prompt
     assert "Runtime limits and context policy come only from HOST_INVOCATION_JSON" in prompt
     assert "At completion write exactly one canonical PMW_RUNTIME_BACKEND_OUTCOME_1" in prompt
+    expected_empty_outcome = canonical_json(
+        {
+            "schema": "PMW_RUNTIME_BACKEND_OUTCOME_1",
+            "success": True,
+            "terminal_reason": "RESEARCH_COMPLETED",
+            "summary": "Research process completed.",
+            "usage": {},
+            "evidence": {},
+            "contributions": [],
+        }
+    ).decode("utf-8")
+    assert expected_empty_outcome in prompt
+    assert "exactly the seven fields" in prompt
+    assert "`contributions` is always a JSON list" in prompt
+    assert "already published through authenticated tools" in prompt
+    assert "singular `contribution`" in prompt
+    assert "`durable_refs`" in prompt
+    assert "publication receipts" in prompt
+    assert "world snapshot refs" in prompt
     assert "BEGIN_HOST_AUTHENTICATED_BRIEFING_JSON" in prompt
     assert "BEGIN_HOST_INVOCATION_JSON" in prompt
     assert evidence["briefing_bytes"] == request.briefing_path.stat().st_size
