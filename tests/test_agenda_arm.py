@@ -16,7 +16,6 @@ from pmw_platform.experiments.agenda_arm import (
     AgendaArm,
     AgendaArmConfig,
     AgendaArmError,
-    absent_agenda_arm_announcement,
     build_agenda_arm,
     not_configured_agenda_arm_launch_value,
     not_configured_agenda_arm_session_evidence,
@@ -431,8 +430,8 @@ def test_arm_verdict_codes_extend_the_plugin_vocabulary_by_exactly_one() -> None
 
 
 def test_runtime_literals_equal_the_producing_module_constants() -> None:
-    # The session runtime describes an arm's absence without importing an
-    # experiment; these two definitions must not drift.
+    # Host-only launch and receipt evidence describe an arm's absence without
+    # importing an experiment; these two definitions must not drift.
     assert (
         orchestrator_module.not_configured_agenda_arm_launch_value()
         == not_configured_agenda_arm_launch_value()
@@ -440,10 +439,6 @@ def test_runtime_literals_equal_the_producing_module_constants() -> None:
     assert (
         orchestrator_module.not_configured_agenda_arm_session_evidence()
         == not_configured_agenda_arm_session_evidence()
-    )
-    assert (
-        orchestrator_module.absent_agenda_arm_announcement()
-        == absent_agenda_arm_announcement()
     )
 
 
@@ -707,7 +702,7 @@ def test_restricted_admitting_slots_reject_a_foreign_admission(
     assert _codes(receipts["arm-slots-session-0002"]) == ["NOT_AN_ADMITTING_SLOT"]
 
 
-def test_no_arm_configured_publishes_everything_and_says_so(
+def test_no_arm_configured_keeps_host_evidence_but_is_agent_surface_silent(
     tmp_path: Path,
 ) -> None:
     prepared = _prepared(tmp_path, cohort_id="arm-none", count=1)
@@ -724,9 +719,21 @@ def test_no_arm_configured_publishes_everything_and_says_so(
     # claim on a nonexistent task was published as written.
     assert len(receipt["publications"]) == 2
     store = RuntimeStore(prepared.cohort_root)
-    assert store.read_launch()["agenda_arm"]["mode"] == "NOT_CONFIGURED"
+    launch = store.read_launch()
+    assert launch["agenda_arm"] == not_configured_agenda_arm_launch_value()
+    assert receipt["launch_sha256"] == result.launch_sha256
     invocation = backend.invocations["arm-none-session-0001"]
-    assert invocation["agenda_arm"] == absent_agenda_arm_announcement()
+    assert invocation["launch_sha256"] == result.launch_sha256
+    assert "agenda_arm" not in invocation
+    invocation_text = canonical_json(invocation).decode("utf-8").casefold()
+    for leaked_label in (
+        "agenda_arm",
+        "agenda arm",
+        "canary",
+        "phase",
+        "evaluation",
+    ):
+        assert leaked_label not in invocation_text
 
 
 # --------------------------------------------------------------------------

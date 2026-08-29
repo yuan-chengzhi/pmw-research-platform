@@ -69,7 +69,6 @@ RUNTIME_SETTLEMENT_SCHEMA = "PMW_RUNTIME_SETTLEMENT_1"
 # runtime must not import one to describe its own absence.  A test pins these
 # against the producing module's constants.
 AGENDA_ARM_LAUNCH_SCHEMA = "PMW_AGENDA_ARM_LAUNCH_1"
-AGENDA_ARM_ANNOUNCEMENT_SCHEMA = "PMW_AGENDA_ARM_1"
 AGENDA_ARM_EVIDENCE_SCHEMA = "PMW_AGENDA_ARM_SESSION_EVIDENCE_1"
 AGENDA_ARM_ENFORCEMENT_SCOPE = (
     "PUBLICATION_TIME_RECORD_VALIDATION_ONLY_NO_RESEARCH_BEHAVIOUR_POLICING"
@@ -212,19 +211,6 @@ def not_configured_agenda_arm_launch_value() -> dict[str, object]:
         "mode": "NOT_CONFIGURED",
         "reason": "NO_AGENDA_ARM_CONFIGURED",
         "enforcement": AGENDA_ARM_ENFORCEMENT_SCOPE,
-    }
-
-
-def absent_agenda_arm_announcement() -> dict[str, object]:
-    """Announce, on the same prompt surface, that no arm is configured."""
-
-    return {
-        "schema": AGENDA_ARM_ANNOUNCEMENT_SCHEMA,
-        "configured": False,
-        "statements": [
-            "This launch configures no agenda arm.",
-            "Records are published as written, with no instrument validation.",
-        ],
     }
 
 
@@ -497,7 +483,7 @@ class _Controller:
         )
 
     def _invocation(self, spec: SessionSpec) -> dict[str, object]:
-        return {
+        invocation: dict[str, object] = {
             "schema": RUNTIME_INVOCATION_SCHEMA,
             "launch_sha256": self.launch_sha256,
             "plan_sha256": self.prepared.plan.sha256,
@@ -537,15 +523,19 @@ class _Controller:
                 if self.verifier_kit is None
                 else self.verifier_kit.briefing_announcement()
             ),
-            # The arm's instrument set is announced on the same authenticated
-            # surface, in the same non-prescriptive voice: what record shapes
-            # are legal and how claiming behaves, with no route and no ordering.
-            "agenda_arm": self._agenda_arm_announcement(),
         }
+        if self.agenda_arm is not None:
+            # A configured arm's instrument set is announced on the same
+            # authenticated surface, in the same non-prescriptive voice: what
+            # record shapes are legal and how claiming behaves, with no route
+            # and no ordering.  Absence is deliberately silent on the Agent
+            # surface; launch and receipt retain the Host control evidence.
+            invocation["agenda_arm"] = self._agenda_arm_announcement()
+        return invocation
 
     def _agenda_arm_announcement(self) -> dict[str, object]:
         if self.agenda_arm is None:
-            return absent_agenda_arm_announcement()
+            raise RuntimeOrchestrationError("AGENDA_ARM_NOT_CONFIGURED")
         value = self.agenda_arm.briefing_announcement()
         if type(value) is not dict:
             raise RuntimeOrchestrationError("AGENDA_ARM_ANNOUNCEMENT_INVALID")

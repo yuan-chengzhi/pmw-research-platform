@@ -66,7 +66,7 @@ from ..world.records import canonical_json
 
 PI_BACKEND_CONFIG_SCHEMA = "PMW_PI_RPC_BACKEND_CONFIG_2"
 PI_BACKEND_PROTOCOL = "PMW_PI_RPC_2"
-PI_PROMPT_PROTOCOL = "PMW_PI_RESEARCH_PROMPT_2"
+PI_PROMPT_PROTOCOL = "PMW_PI_RESEARCH_PROMPT_3"
 PI_RPC_DIRECTION_HOST_TO_PI = "HOST_TO_PI"
 PI_RPC_DIRECTION_PI_TO_HOST = "PI_TO_HOST"
 
@@ -167,9 +167,10 @@ _TOOL_ALLOWLIST_DOMAIN = b"PMW_PI_TOOL_ALLOWLIST_1\0"
 _INSTALLATION_TREE_PROTOCOL = "PMW_PI_INSTALLATION_TREE_2"
 _INSTALLATION_TREE_DOMAIN = b"PMW_PI_INSTALLATION_TREE_2\0"
 _PROMPT_PROTOCOL_BYTES = (
-    b"PMW_PI_RESEARCH_PROMPT_2\0persistent-world-temporary-process-context\0"
+    b"PMW_PI_RESEARCH_PROMPT_3\0persistent-world-temporary-process-context\0"
     b"authenticated-briefing-orientation-identity\0briefing-json\0"
-    b"invocation-json\0identity-free-backend-outcome\0"
+    b"invocation-json\0configured-agenda-arm-announcement-only\0"
+    b"identity-free-backend-outcome\0"
     b"exact-seven-field-backend-outcome\0workspace-relative-result-path\0"
     b"file-or-final-envelope"
 )

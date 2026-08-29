@@ -590,7 +590,7 @@ def test_config_is_strict_json_and_public_identity_redacts_oauth(tmp_path: Path)
     assert backend.identity.public_config["expected_context_window_tokens"] is None
     assert backend.identity.public_config["disable_auto_compaction"] is False
     assert backend.identity.public_config["prompt_protocol"] == (
-        "PMW_PI_RESEARCH_PROMPT_2"
+        "PMW_PI_RESEARCH_PROMPT_3"
     )
     assert len(backend.identity.public_config["account_label_sha256"]) == 64
     assert str(agent_dir) not in public
@@ -684,11 +684,23 @@ def test_prompt_defers_role_and_mathematical_objective_to_briefing(
     assert "temporary private context" in prompt
     assert "persistent mathematical world" in prompt
     assert "The mathematical world remains after this process ends." in prompt
+    assert evidence["protocol"] == "PMW_PI_RESEARCH_PROMPT_3"
     assert "authenticated Orientation mechanism" in prompt
     assert "Your identity, role, mathematical objective" in prompt
     header = prompt.split("BEGIN_HOST_AUTHENTICATED_BRIEFING_JSON", 1)[0].casefold()
     for forbidden in ("research session", "campaign", "phase", "evaluation"):
         assert forbidden not in header
+    # A no-arm invocation contains no arm label or absence announcement.  The
+    # Pi header must not reintroduce experiment metadata before provider input.
+    no_arm_prompt = prompt.casefold()
+    for forbidden in (
+        "agenda_arm",
+        "agenda arm",
+        "canary",
+        "phase",
+        "evaluation",
+    ):
+        assert forbidden not in no_arm_prompt
     assert "Read the full current mathematical state" not in prompt
     assert "choose a valuable route" not in prompt
     assert "leave a concise, checkable contribution" not in prompt
